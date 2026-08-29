@@ -204,6 +204,194 @@ fn init_writes_managed_shortcut_files() {
 }
 
 #[test]
+fn init_defaults_to_text_mode_and_points_at_shell_integration() {
+    let ctx = TestContext::new("init-text-mode");
+
+    let result = ctx.run(["init"]);
+
+    assert!(result.status.success(), "stderr: {}", result.stderr);
+    assert!(result.stdout.contains("shortcut_mode = text"));
+    assert!(result.stdout.contains("gtab shell-init"));
+    assert!(
+        ctx.read_to_string(ctx.shortcut_include_path())
+            .contains("keybind = cmd+g=text:gtab\\x0d")
+    );
+}
+
+#[test]
+fn init_switches_to_shell_mode_when_the_shell_integration_is_installed() {
+    let ctx = TestContext::new("init-shell-mode");
+    std::fs::write(
+        ctx.home_path().join(".zshrc"),
+        "eval \"$(gtab shell-init zsh)\"\n",
+    )
+    .unwrap();
+
+    let result = ctx.run(["init"]);
+
+    assert!(result.status.success(), "stderr: {}", result.stderr);
+    assert!(result.stdout.contains("shortcut_mode = shell"));
+    assert!(!result.stdout.contains("Cmd+G currently types `gtab`"));
+
+    let include = ctx.read_to_string(ctx.shortcut_include_path());
+    assert!(include.contains("keybind = cmd+g=text:\\x1b[71;9u"));
+    assert!(!include.contains("text:gtab"));
+    assert!(
+        ctx.read_to_string(ctx.config_path())
+            .contains("shortcut_mode=shell")
+    );
+}
+
+#[test]
+fn set_shortcut_mode_rewrites_the_managed_keybind() {
+    let ctx = TestContext::new("set-shortcut-mode");
+    assert!(ctx.run(["init"]).status.success());
+
+    let result = ctx.run(["set", "shortcut_mode", "shell"]);
+
+    assert!(result.status.success(), "stderr: {}", result.stderr);
+    assert!(result.stdout.contains("Set shortcut_mode = shell"));
+    assert!(result.stdout.contains("invisible trigger"));
+    assert!(result.stdout.contains("No `gtab shell-init` line found"));
+    assert!(
+        ctx.read_to_string(ctx.shortcut_include_path())
+            .contains("keybind = cmd+g=text:\\x1b[71;9u")
+    );
+
+    let back = ctx.run(["set", "shortcut_mode", "text"]);
+    assert!(back.status.success(), "stderr: {}", back.stderr);
+    assert!(
+        ctx.read_to_string(ctx.shortcut_include_path())
+            .contains("keybind = cmd+g=text:gtab\\x0d")
+    );
+
+    let settings = ctx.run(["set"]);
+    assert!(settings.stdout.contains("shortcut_mode = text"));
+}
+
+#[test]
+fn init_warns_when_shell_mode_has_no_shell_integration() {
+    let ctx = TestContext::new("init-shell-mode-missing-integration");
+    std::fs::write(
+        ctx.home_path().join(".zshrc"),
+        "eval \"$(gtab shell-init zsh)\"\n",
+    )
+    .unwrap();
+    assert!(ctx.run(["init"]).stdout.contains("shortcut_mode = shell"));
+
+    // The user later drops the integration line but keeps shell mode.
+    std::fs::remove_file(ctx.home_path().join(".zshrc")).unwrap();
+    let result = ctx.run(["init"]);
+
+    assert!(result.status.success(), "stderr: {}", result.stderr);
+    assert!(result.stdout.contains("shortcut_mode = shell"));
+    assert!(
+        result
+            .stdout
+            .contains("no `gtab shell-init` line was found in your shell rc")
+    );
+    assert!(result.stdout.contains("Cmd+G will do nothing"));
+    assert!(result.stdout.contains("gtab set shortcut_mode text"));
+
+    let settings = ctx.run(["set"]);
+    assert!(
+        settings
+            .stdout
+            .contains("WARNING: no `gtab shell-init` line")
+    );
+}
+
+#[test]
+fn settings_confirm_a_working_shell_integration() {
+    let ctx = TestContext::new("settings-shell-integration-ok");
+    std::fs::write(
+        ctx.home_path().join(".zshrc"),
+        "eval \"$(gtab shell-init zsh)\"\n",
+    )
+    .unwrap();
+    assert!(ctx.run(["init"]).status.success());
+
+    let settings = ctx.run(["set"]);
+
+    assert!(settings.stdout.contains("shortcut_mode = shell"));
+    assert!(settings.stdout.contains("widget in your shell rc"));
+    assert!(!settings.stdout.contains("WARNING"));
+}
+
+#[test]
+fn set_shortcut_mode_rejects_invalid_values() {
+    let ctx = TestContext::new("set-shortcut-mode-invalid");
+
+    let result = ctx.run(["set", "shortcut_mode", "global"]);
+
+    assert!(!result.status.success());
+    assert!(
+        result
+            .stderr
+            .contains("shortcut_mode value must be \'shell\' or \'text\'")
+    );
+}
+
+#[test]
+fn shell_init_prints_a_bindable_widget_for_each_supported_shell() {
+    let ctx = TestContext::new("shell-init");
+
+    let zsh = ctx.run(["shell-init", "zsh"]);
+    assert!(zsh.status.success(), "stderr: {}", zsh.stderr);
+    assert!(zsh.stdout.contains("zle -N _gtab_launch_widget"));
+    assert!(
+        zsh.stdout
+            .contains("bindkey \'\\e[71;9u\' _gtab_launch_widget")
+    );
+    assert!(!zsh.stdout.contains("alias"));
+
+    let bash = ctx.run(["shell-init", "bash"]);
+    assert!(bash.status.success(), "stderr: {}", bash.stderr);
+    assert!(
+        bash.stdout
+            .contains(r#"-x '"\C-x\C-g": _gtab_launch_widget'"#)
+    );
+    assert!(bash.stdout.contains(r#"'"\e[71;9u": "\C-x\C-g"'"#));
+
+    let fish = ctx.run(["shell-init", "fish"]);
+    assert!(fish.status.success(), "stderr: {}", fish.stderr);
+    assert!(fish.stdout.contains("commandline -f repaint"));
+}
+
+#[test]
+fn shell_init_falls_back_to_the_shell_environment_variable() {
+    let ctx = TestContext::new("shell-init-env");
+
+    let mut command = ctx.command();
+    command.arg("shell-init");
+    command.env("SHELL", "/opt/homebrew/bin/fish");
+    let result = ctx.capture(&mut command);
+
+    assert!(result.status.success(), "stderr: {}", result.stderr);
+    assert!(result.stdout.contains("gtab shell integration (fish)"));
+}
+
+#[test]
+fn shell_init_rejects_unsupported_shells() {
+    let ctx = TestContext::new("shell-init-unsupported");
+
+    let result = ctx.run(["shell-init", "tcsh"]);
+
+    assert!(!result.status.success());
+    assert!(result.stderr.contains("unsupported shell \'tcsh\'"));
+}
+
+#[test]
+fn shell_init_reports_a_missing_shell_environment() {
+    let ctx = TestContext::new("shell-init-missing-env");
+
+    let result = ctx.run(["shell-init"]);
+
+    assert!(!result.status.success());
+    assert!(result.stderr.contains("could not detect the current shell"));
+}
+
+#[test]
 fn direct_launch_of_missing_workspace_reports_error() {
     let ctx = TestContext::new("launch-missing");
 

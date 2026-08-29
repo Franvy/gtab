@@ -27,6 +27,11 @@ pub enum Commands {
     Tui,
     /// Configure the default Ghostty-local shortcut.
     Init,
+    /// Print shell integration so the shortcut runs gtab without typing it.
+    ShellInit {
+        #[arg(value_name = "shell")]
+        shell: Option<String>,
+    },
     /// List saved workspaces.
     List,
     /// Save the current Ghostty window as a workspace.

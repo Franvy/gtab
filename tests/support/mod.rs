@@ -83,6 +83,14 @@ impl TestContext {
         self.gtab_dir.join("config")
     }
 
+    pub fn home_path(&self) -> PathBuf {
+        self.home_dir.clone()
+    }
+
+    pub fn shortcut_include_path(&self) -> PathBuf {
+        self.gtab_dir.join("ghostty-shortcut.conf")
+    }
+
     pub fn ghostty_config_path(&self) -> PathBuf {
         self.xdg_config_home.join("ghostty").join("config.ghostty")
     }

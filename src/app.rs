@@ -2776,7 +2776,7 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, _app: &App, env: &AppEnv, theme: 
             ]),
             Line::from(vec![
                 Span::styled("mode      ", theme.dim),
-                Span::styled("same-shell launch", theme.warning),
+                Span::styled(env.shortcut_mode_display(), theme.warning),
             ]),
             Line::from(vec![
                 Span::styled("scope     ", theme.dim),
@@ -2810,7 +2810,7 @@ fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv, theme: &
             Line::default(),
             section_line(inner.width, "Input", theme),
             Line::from("Press the shortcut directly, or type it manually."),
-            Line::from("This types `gtab` into the focused Ghostty shell."),
+            Line::from(shortcut_mode_hint(env)),
             Line::default(),
             section_line(inner.width, "Examples", theme),
             Line::from("cmd+g"),
@@ -2820,6 +2820,15 @@ fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv, theme: &
         .wrap(Wrap { trim: true }),
         inner,
     );
+}
+
+fn shortcut_mode_hint(env: &AppEnv) -> &'static str {
+    match env.shortcut_mode() {
+        crate::core::ShortcutMode::Text => "This types `gtab` into the focused Ghostty shell.",
+        crate::core::ShortcutMode::Shell => {
+            "This sends a silent trigger handled by `gtab shell-init`."
+        }
+    }
 }
 
 fn draw_help_dialog(frame: &mut Frame<'_>, theme: &Theme) {
@@ -3179,6 +3188,7 @@ mod tests {
             config: Config {
                 close_tab: true,
                 ghostty_shortcut: "cmd+g".to_string(),
+                shortcut_mode: crate::core::ShortcutMode::Text,
             },
         }
     }

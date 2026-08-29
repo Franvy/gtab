@@ -16,6 +16,14 @@ brew install gtab
 gtab init
 ```
 
+For a shortcut that leaves no text behind, add the shell integration and re-run `gtab init`:
+
+```bash
+echo 'eval "$(gtab shell-init zsh)"' >> ~/.zshrc   # bash: shell-init bash >> ~/.bashrc
+exec zsh
+gtab init
+```
+
 Reload Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghostty shell to open the workspace launcher.
 
 ---
@@ -28,7 +36,8 @@ Reload Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghos
 - Launch from a small keyboard-first TUI, or directly from the shell
 - New window automatically aligns to your current Ghostty window position and size
 - Rename, delete, and search workspaces without leaving the TUI
-- Fast in-app shortcut via `Cmd+G` set up with `gtab init`
+- The TUI adapts to the terminal width: quick settings hides first, then the layout preview moves below the workspace list and the names wrap into columns
+- Fast in-app shortcut via `Cmd+G` set up with `gtab init` — with the shell integration installed it launches silently, leaving no command text and no shell history entry
 
 ## What It Does Not Do
 
@@ -83,7 +92,7 @@ When you launch from the TUI, the new Ghostty window is repositioned to match yo
 Directory Space stores named directory paths only. It does not rebuild Ghostty tabs or windows.
 
 - Press `f` in the TUI to switch to Directory Space.
-- Saved directories are shown in an adaptive multi-column grid that wraps as the window width changes.
+- Saved directories are shown in a compact, balanced grid; each column is sized to its own widest entry, and columns are added only when the list no longer fits on one page.
 - Press `a` to save the current shell directory as a named entry.
 - Press `Enter` (or double-click) to replace the current split with a fresh shell started in that directory.
 
@@ -117,6 +126,7 @@ gtab() {
 ```text
 gtab                     Open the TUI
 gtab init                Enable the Ghostty-local Cmd+G shortcut
+gtab shell-init <shell>  Print the shell integration for zsh, bash, or fish
 gtab save <name>         Save the current Ghostty window
 gtab <name>              Launch a workspace directly
 gtab list                List saved workspaces
@@ -131,6 +141,7 @@ gtab edit <name>                       Open workspace file in $EDITOR
 gtab set                               Show current settings
 gtab set close_tab on|off              Auto-close the launching tab after launch
 gtab set ghostty_shortcut cmd+g|off    Change or disable the Ghostty shortcut
+gtab set shortcut_mode shell|text      Silent widget trigger, or type `gtab` into the shell
 ```
 
 Workspaces are stored as plain `.applescript` files in `~/.config/gtab/`.
@@ -175,6 +186,9 @@ gtab set ghostty_shortcut off
 
 # Reload Ghostty config so Cmd+G stops working
 
+# Remove the shell integration line from your shell rc if you added one
+#   eval "$(gtab shell-init zsh)"
+
 # Then remove the binary
 brew uninstall gtab
 # or: cargo uninstall gtab
@@ -187,15 +201,37 @@ rm -rf ~/.config/gtab
 
 ## Shortcut Model
 
-`gtab init` writes a managed Ghostty keybind file and adds an `include` line to your Ghostty config:
+`gtab init` writes a managed Ghostty keybind file and adds an `include` line to your Ghostty config. Ghostty has no keybind action that runs an external command, so the keybind sends text to the focused shell. There are two ways to do that, selected by `shortcut_mode`.
+
+### `shortcut_mode = shell` (recommended)
+
+```conf
+keybind = cmd+g=text:\x1b[71;9u
+```
+
+The keybind sends an invisible trigger sequence instead of a command. A shell widget installed by `gtab shell-init` is bound to that sequence and runs `gtab` directly:
+
+```bash
+eval "$(gtab shell-init zsh)"      # ~/.zshrc
+eval "$(gtab shell-init bash)"     # ~/.bashrc
+gtab shell-init fish | source      # ~/.config/fish/config.fish
+```
+
+Nothing is echoed into the prompt, nothing enters shell history, and a half-typed command line is restored exactly as it was when the TUI exits.
+
+`gtab init` switches to this mode automatically once it finds a `gtab shell-init` line in your shell rc files. You can also set it explicitly with `gtab set shortcut_mode shell`. If shell mode is active but the integration is missing, `gtab init` and `gtab set` both warn that the shortcut will do nothing.
+
+Upgrading from an older gtab changes nothing on its own: existing installs keep `shortcut_mode = text` until you install the integration and re-run `gtab init`.
+
+### `shortcut_mode = text` (default, zero setup)
 
 ```conf
 keybind = cmd+g=text:gtab\x0d
 ```
 
-This works only when Ghostty is focused. It is fast because it is effectively the same as typing `gtab` in the active shell.
+Ghostty types `gtab` into the active shell. No shell configuration needed, but the command stays visible on screen and lands in shell history.
 
-**Tradeoff:** this shortcut is not safe inside full-screen interactive programs like Claude Code, vim, or fzf — it will type the literal text `gtab` into them. Quit those programs first, or use `gtab <name>` from a clean shell prompt.
+**Tradeoff (both modes):** the shortcut only reaches the shell, so it is not safe inside full-screen interactive programs like Claude Code, vim, or fzf — `text` mode types `gtab` into them and `shell` mode sends a stray escape sequence. Quit those programs first, or use `gtab <name>` from a clean shell prompt.
 
 If your Ghostty config is managed by Nix/Home Manager or another read-only setup, `gtab init` will still write `~/.config/gtab/ghostty-shortcut.conf`, then tell you to add this line to your Ghostty config source manually:
 
@@ -232,11 +268,19 @@ That is why `gtab` is lightweight: it stores layout metadata, not live terminal 
 
 ## FAQ
 
-### Why does `Cmd+G` type text instead of running the binary directly?
+### Why does `Cmd+G` send text instead of running the binary directly?
 
-Ghostty keybindings do not have an action for running external commands. The `text` action sends a string to the active shell — which is effectively the same as typing it yourself.
+Ghostty keybindings do not have an action for running external commands. The `text` action sends a string to the active shell, so that string is the only channel available.
+
+`shortcut_mode = shell` uses that channel for an invisible trigger sequence rather than the literal word `gtab`, and lets a shell widget do the launching — the same technique fzf and atuin use for their key bindings.
 
 See: [ghostty.org/docs/config/keybind](https://ghostty.org/docs/config/keybind)
+
+### The shortcut does nothing after switching to `shortcut_mode = shell`
+
+The widget is missing. Run `gtab set` — in shell mode it checks your shell rc files and warns if no `gtab shell-init` line is there. Add the line back and start a new shell, or fall back with `gtab set shortcut_mode text`.
+
+The check scans every common rc file without knowing which shell you are in, so if you use both zsh and bash and only installed the integration for one of them, the shortcut works only in that shell.
 
 ### Why doesn't gtab edit my Nix/Home Manager config directly?
 

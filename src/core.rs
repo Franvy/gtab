@@ -16,6 +16,19 @@ const DIR_EXT: &str = "path";
 const DIRS_DIR_NAME: &str = "dirs";
 const DEFAULT_GHOSTTY_SHORTCUT: &str = "cmd+g";
 const GHOSTTY_SHORTCUT_INCLUDE_NAME: &str = "ghostty-shortcut.conf";
+const SHELL_TRIGGER_GHOSTTY_ESCAPE: &str = "\\x1b[71;9u";
+const SHELL_TRIGGER_READLINE_ESCAPE: &str = "\\e[71;9u";
+const SHELL_TRIGGER_FISH_ESCAPE: &str = "\\e\\[71\\;9u";
+const SHELL_TRIGGER_BASH_CHORD: &str = "\\C-x\\C-g";
+const SHELL_INIT_MARKER: &str = "gtab shell-init";
+const SHELL_RC_CANDIDATES: [&str; 6] = [
+    ".zshrc",
+    ".zshenv",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".config/fish/config.fish",
+];
 const GHOSTTY_EXTERNAL_CONFIG_REASON: &str = "Ghostty config appears to be managed externally (for example by Nix/Home Manager) and was not modified.";
 const GHOSTTY_DISCOVERY_ATTEMPTS: usize = 100;
 const GHOSTTY_DISCOVERY_DELAY_MS: u64 = 50;
@@ -74,6 +87,44 @@ unsafe extern "C" {
 pub struct Config {
     pub close_tab: bool,
     pub ghostty_shortcut: String,
+    pub shortcut_mode: ShortcutMode,
+}
+
+/// How the Ghostty keybind reaches `gtab`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutMode {
+    /// Ghostty types `gtab` into the focused shell. Leaves the command on screen.
+    Text,
+    /// Ghostty sends an invisible trigger sequence that the `gtab shell-init`
+    /// widget binds to, so nothing is echoed and nothing enters shell history.
+    Shell,
+}
+
+impl ShortcutMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Shell => "shell",
+        }
+    }
+}
+
+/// Shells that `gtab shell-init` can emit an integration snippet for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellKind {
+    Zsh,
+    Bash,
+    Fish,
+}
+
+impl ShellKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Zsh => "zsh",
+            Self::Bash => "bash",
+            Self::Fish => "fish",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +263,12 @@ impl AppEnv {
         self.sync_ghostty_shortcut()
     }
 
+    pub fn set_shortcut_mode(&mut self, mode: &str) -> Result<GhosttyShortcutApplyResult> {
+        self.config.shortcut_mode = normalize_shortcut_mode(mode)?;
+        self.write_config()?;
+        self.sync_ghostty_shortcut()
+    }
+
     pub fn ensure_ghostty_shortcut(&self) -> Result<GhosttyShortcutApplyResult> {
         let sync = self.preview_ghostty_shortcut_sync();
         self.sync_ghostty_shortcut_files(&sync)
@@ -219,6 +276,9 @@ impl AppEnv {
 
     pub fn init_shortcuts(&mut self) -> Result<GhosttyShortcutApplyResult> {
         self.config.ghostty_shortcut = DEFAULT_GHOSTTY_SHORTCUT.to_string();
+        if self.shell_integration_installed() {
+            self.config.shortcut_mode = ShortcutMode::Shell;
+        }
         self.write_config()?;
         let sync = self.sync_ghostty_shortcut()?;
         self.cleanup_legacy_shortcut_artifacts().ok();
@@ -520,6 +580,24 @@ impl AppEnv {
         &self.config.ghostty_shortcut
     }
 
+    pub fn shortcut_mode(&self) -> ShortcutMode {
+        self.config.shortcut_mode
+    }
+
+    pub fn shortcut_mode_display(&self) -> &'static str {
+        match self.config.shortcut_mode {
+            ShortcutMode::Text => "text (types `gtab` into the shell)",
+            ShortcutMode::Shell => "shell (silent widget trigger)",
+        }
+    }
+
+    /// True when a `gtab shell-init` line is present in one of the user's shell rc files.
+    pub fn shell_integration_installed(&self) -> bool {
+        home_dir()
+            .map(|home| shell_integration_installed(&home))
+            .unwrap_or(false)
+    }
+
     fn launch_workspace_script_path(&self, path: &Path) -> Result<()> {
         let output = Command::new("osascript")
             .arg(path)
@@ -556,6 +634,7 @@ impl AppEnv {
             }),
             include_path: self.base_dir.join(GHOSTTY_SHORTCUT_INCLUDE_NAME),
             shortcut: self.config.ghostty_shortcut.clone(),
+            mode: self.config.shortcut_mode,
         }
     }
 
@@ -621,7 +700,10 @@ impl AppEnv {
     }
 
     fn write_ghostty_shortcut_include(&self, path: &Path) -> Result<bool> {
-        let content = build_ghostty_shortcut_include(&self.config.ghostty_shortcut);
+        let content = build_ghostty_shortcut_include(
+            &self.config.ghostty_shortcut,
+            self.config.shortcut_mode,
+        );
         if fs::read_to_string(path).ok().as_deref() == Some(content.as_str()) {
             return Ok(false);
         }
@@ -899,6 +981,8 @@ impl Config {
                 config.close_tab = matches!(value.trim(), "true" | "on");
             } else if key.trim() == "ghostty_shortcut" && !value.trim().is_empty() {
                 config.ghostty_shortcut = normalize_ghostty_shortcut(value.trim())?;
+            } else if key.trim() == "shortcut_mode" && !value.trim().is_empty() {
+                config.shortcut_mode = normalize_shortcut_mode(value.trim())?;
             }
         }
 
@@ -908,8 +992,9 @@ impl Config {
     fn serialize(&self) -> String {
         let close_tab = if self.close_tab { "true" } else { "false" };
         format!(
-            "close_tab={close_tab}\nghostty_shortcut={}\n",
+            "close_tab={close_tab}\nghostty_shortcut={}\nshortcut_mode={}\n",
             self.ghostty_shortcut,
+            self.shortcut_mode.as_str(),
         )
     }
 }
@@ -919,6 +1004,7 @@ impl Default for Config {
         Self {
             close_tab: false,
             ghostty_shortcut: DEFAULT_GHOSTTY_SHORTCUT.to_string(),
+            shortcut_mode: ShortcutMode::Text,
         }
     }
 }
@@ -984,6 +1070,146 @@ fn normalize_ghostty_shortcut(shortcut: &str) -> Result<String> {
     }
 
     Ok(normalized)
+}
+
+fn normalize_shortcut_mode(mode: &str) -> Result<ShortcutMode> {
+    match mode.trim().to_lowercase().as_str() {
+        "text" | "type" => Ok(ShortcutMode::Text),
+        "shell" | "widget" => Ok(ShortcutMode::Shell),
+        "" => bail!("shortcut_mode cannot be empty"),
+        other => bail!("shortcut_mode value must be 'shell' or 'text', got '{other}'"),
+    }
+}
+
+fn parse_shell_kind(shell: &str) -> Result<ShellKind> {
+    let name = shell
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('-')
+        .to_lowercase();
+
+    match name.as_str() {
+        "zsh" => Ok(ShellKind::Zsh),
+        "bash" => Ok(ShellKind::Bash),
+        "fish" => Ok(ShellKind::Fish),
+        "" => bail!("missing shell name; use `gtab shell-init zsh|bash|fish`"),
+        other => bail!("unsupported shell '{other}'; use zsh, bash, or fish"),
+    }
+}
+
+/// Resolves the shell for `gtab shell-init` when no shell argument is given.
+pub fn detect_shell_kind() -> Result<ShellKind> {
+    let shell = env::var("SHELL").unwrap_or_default();
+    if shell.trim().is_empty() {
+        bail!("could not detect the current shell; use `gtab shell-init zsh|bash|fish`");
+    }
+
+    parse_shell_kind(&shell)
+}
+
+/// Resolves a shell name coming from the CLI, falling back to `$SHELL`.
+pub fn resolve_shell_kind(requested: Option<&str>) -> Result<ShellKind> {
+    match requested {
+        Some(shell) => parse_shell_kind(shell),
+        None => detect_shell_kind(),
+    }
+}
+
+/// Shell snippet that binds the invisible Ghostty trigger to a `gtab` launcher,
+/// so the shortcut never echoes `gtab` into the prompt or shell history.
+pub fn render_shell_init(shell: ShellKind) -> String {
+    match shell {
+        ShellKind::Zsh => format!(
+            r#"# gtab shell integration (zsh)
+# Add to ~/.zshrc:  eval "$(gtab shell-init zsh)"
+if [[ -o interactive ]]; then
+  _gtab_launch_widget() {{
+    # zle detaches stdin from the terminal, and macOS kqueue cannot watch the
+    # /dev/tty clone device, so the TUI needs the real device path from $TTY.
+    local gtab_tty=${{TTY:-$(command tty 2>/dev/null)}}
+    if [[ -c $gtab_tty ]]; then
+      command gtab <$gtab_tty >$gtab_tty 2>&1
+    else
+      command gtab
+    fi
+    local ret=$?
+    zle reset-prompt
+    return $ret
+  }}
+  zle -N _gtab_launch_widget
+  bindkey '{seq}' _gtab_launch_widget
+  bindkey -M viins '{seq}' _gtab_launch_widget 2>/dev/null
+  bindkey -M vicmd '{seq}' _gtab_launch_widget 2>/dev/null
+fi
+"#,
+            seq = SHELL_TRIGGER_READLINE_ESCAPE
+        ),
+        ShellKind::Bash => format!(
+            r#"# gtab shell integration (bash)
+# Add to ~/.bashrc:  eval "$(gtab shell-init bash)"
+if [[ $- == *i* ]]; then
+  _gtab_launch_widget() {{
+    # readline hands the function the real tty; never redirect to /dev/tty,
+    # because macOS kqueue cannot watch that clone device.
+    local gtab_tty
+    gtab_tty=$(command tty 2>/dev/null)
+    if [[ -c $gtab_tty ]]; then
+      command gtab <"$gtab_tty" >"$gtab_tty" 2>&1
+    else
+      command gtab
+    fi
+  }}
+  # bash 3.2 (the macOS system bash) cannot run a function bound straight to an
+  # escape sequence, so the trigger is a macro that fires a short chord instead.
+  bind -m emacs-standard -x '"{chord}": _gtab_launch_widget' 2>/dev/null
+  bind -m vi-insert -x '"{chord}": _gtab_launch_widget' 2>/dev/null
+  bind -m vi-command -x '"{chord}": _gtab_launch_widget' 2>/dev/null
+  bind -m emacs-standard '"{seq}": "{chord}"' 2>/dev/null
+  bind -m vi-insert '"{seq}": "{chord}"' 2>/dev/null
+  bind -m vi-command '"{seq}": "{chord}"' 2>/dev/null
+fi
+"#,
+            seq = SHELL_TRIGGER_READLINE_ESCAPE,
+            chord = SHELL_TRIGGER_BASH_CHORD
+        ),
+        ShellKind::Fish => format!(
+            r#"# gtab shell integration (fish)
+# Add to ~/.config/fish/config.fish:  gtab shell-init fish | source
+function _gtab_launch_widget
+    # macOS kqueue cannot watch the /dev/tty clone device, so pass the real one.
+    set -l gtab_tty (command tty 2>/dev/null)
+    if test -c "$gtab_tty"
+        command gtab <$gtab_tty >$gtab_tty 2>&1
+    else
+        command gtab
+    end
+    commandline -f repaint
+end
+
+if status is-interactive
+    bind {seq} _gtab_launch_widget
+    bind -M insert {seq} _gtab_launch_widget 2>/dev/null
+end
+"#,
+            seq = SHELL_TRIGGER_FISH_ESCAPE
+        ),
+    }
+}
+
+/// Best-effort check for an installed `gtab shell-init` line in the user's shell rc files.
+fn shell_integration_installed(home: &Path) -> bool {
+    SHELL_RC_CANDIDATES.iter().any(|candidate| {
+        fs::read_to_string(home.join(candidate))
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with('#'))
+                    .any(|line| line.contains(SHELL_INIT_MARKER))
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn render_shell_cd_command(path: &Path) -> String {
@@ -1846,14 +2072,19 @@ fn apple_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn build_ghostty_shortcut_include(shortcut: &str) -> String {
+fn build_ghostty_shortcut_include(shortcut: &str, mode: ShortcutMode) -> String {
     if is_shortcut_disabled(shortcut) {
         return "# Managed by gtab. Update this with `gtab init` or `gtab set ghostty_shortcut`.\n# Ghostty-local shortcut is disabled.\n".to_string();
     }
 
-    format!(
-        "# Managed by gtab. Update this with `gtab init` or `gtab set ghostty_shortcut`.\n# Default Ghostty-local shortcut: send `gtab` to the focused shell for same-tab launch.\nkeybind = {shortcut}=text:gtab\\x0d\n"
-    )
+    match mode {
+        ShortcutMode::Text => format!(
+            "# Managed by gtab. Update this with `gtab init` or `gtab set ghostty_shortcut`.\n# shortcut_mode = text: type `gtab` into the focused shell for same-tab launch.\nkeybind = {shortcut}=text:gtab\\x0d\n"
+        ),
+        ShortcutMode::Shell => format!(
+            "# Managed by gtab. Update this with `gtab init` or `gtab set ghostty_shortcut`.\n# shortcut_mode = shell: send an invisible trigger handled by `gtab shell-init`.\n# Nothing is echoed into the prompt and nothing enters shell history.\nkeybind = {shortcut}=text:{SHELL_TRIGGER_GHOSTTY_ESCAPE}\n"
+        ),
+    }
 }
 
 fn render_ghostty_include_config_line(include_path: &Path) -> String {
@@ -2054,6 +2285,7 @@ pub struct GhosttyShortcutSync {
     pub config_path: PathBuf,
     pub include_path: PathBuf,
     pub shortcut: String,
+    pub mode: ShortcutMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2161,13 +2393,27 @@ pub fn format_settings(env: &AppEnv) -> String {
     let ghostty = env.preview_ghostty_shortcut_sync();
     let ghostty_note = if is_shortcut_disabled(&env.config.ghostty_shortcut) {
         "Ghostty-local shortcut is disabled. Run `gtab init` to restore the default same-shell Cmd+G."
+            .to_string()
     } else {
-        "Ghostty-local shortcut is the default fast path. It types `gtab` into the focused Ghostty shell and only works when Ghostty is focused."
+        match env.config.shortcut_mode {
+            ShortcutMode::Text => "The shortcut types `gtab` into the focused Ghostty shell, so the command stays on screen. Run `gtab shell-init zsh` for a silent shortcut.".to_string(),
+            ShortcutMode::Shell => {
+                let shell = detect_shell_kind().map(ShellKind::as_str).unwrap_or("zsh");
+                if env.shell_integration_installed() {
+                    "The shortcut sends an invisible trigger handled by the `gtab shell-init` widget in your shell rc.".to_string()
+                } else {
+                    format!(
+                        "WARNING: no `gtab shell-init` line found in your shell rc, so the shortcut will do nothing. Add `eval \"$(gtab shell-init {shell})\"`, or run `gtab set shortcut_mode text`."
+                    )
+                }
+            }
+        }
     };
 
     format!(
-        "Settings:\n  close_tab = {close_tab}\n  ghostty_shortcut = {}\n  ghostty_config = {}\n  ghostty_include = {}\n  {ghostty_note}",
+        "Settings:\n  close_tab = {close_tab}\n  ghostty_shortcut = {}\n  shortcut_mode = {}\n  ghostty_config = {}\n  ghostty_include = {}\n  {ghostty_note}",
         env.config.ghostty_shortcut,
+        env.config.shortcut_mode.as_str(),
         ghostty.config_path.display(),
         ghostty.include_path.display(),
     )
@@ -2176,13 +2422,14 @@ pub fn format_settings(env: &AppEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppEnv, Config, GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame,
-        WorkspaceLaunchMode, apple_escape, build_ghostty_cd_script,
+        AppEnv, Config, GhosttyConfigSync, GhosttyShortcutApplyStatus, ShellKind, ShortcutMode,
+        TabRow, WindowFrame, WorkspaceLaunchMode, apple_escape, build_ghostty_cd_script,
         build_ghostty_replace_directory_script, build_ghostty_shortcut_include,
         build_workspace_script, format_workspace_list, looks_like_shell_default_title,
-        normalize_captured_tab_title, parse_window_frame, parse_workspace_rows,
-        parse_workspace_tabs, plan_workspace_launch, render_ghostty_direct_cd_command,
-        render_ghostty_include_config_line, render_shell_cd_command,
+        normalize_captured_tab_title, normalize_shortcut_mode, parse_shell_kind,
+        parse_window_frame, parse_workspace_rows, parse_workspace_tabs, plan_workspace_launch,
+        render_ghostty_direct_cd_command, render_ghostty_include_config_line,
+        render_shell_cd_command, render_shell_init, shell_integration_installed,
         should_switch_to_ascii_input_source, sync_ghostty_include_reference,
         validate_workspace_name, workspace_requires_true_legacy_launch,
     };
@@ -2833,16 +3080,142 @@ end tell"#;
 
     #[test]
     fn ghostty_shortcut_include_writes_keybind_command() {
-        let include = build_ghostty_shortcut_include("cmd+g");
-        assert!(include.contains("Default Ghostty-local shortcut"));
+        let include = build_ghostty_shortcut_include("cmd+g", ShortcutMode::Text);
+        assert!(include.contains("shortcut_mode = text"));
         assert!(include.contains("keybind = cmd+g=text:gtab\\x0d"));
     }
 
     #[test]
+    fn shell_mode_include_sends_invisible_trigger_instead_of_typing_gtab() {
+        let include = build_ghostty_shortcut_include("cmd+g", ShortcutMode::Shell);
+        assert!(include.contains("shortcut_mode = shell"));
+        assert!(include.contains("keybind = cmd+g=text:\\x1b[71;9u"));
+        assert!(!include.contains("text:gtab"));
+    }
+
+    #[test]
     fn disabled_ghostty_shortcut_include_has_no_keybind() {
-        let include = build_ghostty_shortcut_include("off");
+        let include = build_ghostty_shortcut_include("off", ShortcutMode::Shell);
         assert!(!include.contains("keybind ="));
         assert!(include.contains("Ghostty-local shortcut is disabled"));
+    }
+
+    #[test]
+    fn shortcut_mode_parses_known_values_and_rejects_others() {
+        assert_eq!(
+            normalize_shortcut_mode(" Shell ").unwrap(),
+            ShortcutMode::Shell
+        );
+        assert_eq!(
+            normalize_shortcut_mode("widget").unwrap(),
+            ShortcutMode::Shell
+        );
+        assert_eq!(normalize_shortcut_mode("TEXT").unwrap(), ShortcutMode::Text);
+        assert_eq!(normalize_shortcut_mode("type").unwrap(), ShortcutMode::Text);
+        assert!(normalize_shortcut_mode("").is_err());
+        assert!(normalize_shortcut_mode("global").is_err());
+    }
+
+    #[test]
+    fn config_round_trips_shortcut_mode() {
+        let path = tempfile_path("gtab-config-shortcut-mode");
+        std::fs::write(
+            &path,
+            "close_tab=false\nghostty_shortcut=cmd+g\nshortcut_mode=shell\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&path).unwrap();
+
+        assert_eq!(config.shortcut_mode, ShortcutMode::Shell);
+        assert!(config.serialize().contains("shortcut_mode=shell"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_defaults_to_text_mode_for_existing_installs() {
+        let path = tempfile_path("gtab-config-legacy-mode");
+        std::fs::write(&path, "close_tab=false\nghostty_shortcut=cmd+g\n").unwrap();
+
+        let config = Config::load(&path).unwrap();
+
+        assert_eq!(config.shortcut_mode, ShortcutMode::Text);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shell_kind_parses_shell_paths_and_login_shell_names() {
+        assert_eq!(parse_shell_kind("/bin/zsh").unwrap(), ShellKind::Zsh);
+        assert_eq!(parse_shell_kind("-zsh").unwrap(), ShellKind::Zsh);
+        assert_eq!(
+            parse_shell_kind("/opt/homebrew/bin/fish").unwrap(),
+            ShellKind::Fish
+        );
+        assert_eq!(parse_shell_kind("BASH").unwrap(), ShellKind::Bash);
+        assert!(parse_shell_kind("  ").is_err());
+        assert!(parse_shell_kind("/bin/tcsh").is_err());
+    }
+
+    #[test]
+    fn shell_init_binds_the_ghostty_trigger_sequence() {
+        let zsh = render_shell_init(ShellKind::Zsh);
+        assert!(zsh.contains("zle -N _gtab_launch_widget"));
+        assert!(zsh.contains("bindkey \'\\e[71;9u\' _gtab_launch_widget"));
+        assert!(zsh.contains("zle reset-prompt"));
+
+        let bash = render_shell_init(ShellKind::Bash);
+        assert!(bash.contains("bind -m emacs-standard -x \'\"\\C-x\\C-g\": _gtab_launch_widget\'"));
+        assert!(bash.contains("bind -m emacs-standard \'\"\\e[71;9u\": \"\\C-x\\C-g\"\'"));
+
+        let fish = render_shell_init(ShellKind::Fish);
+        assert!(fish.contains("bind \\e\\[71\\;9u _gtab_launch_widget"));
+        assert!(fish.contains("commandline -f repaint"));
+    }
+
+    #[test]
+    fn shell_init_snippets_run_gtab_without_echoing_it() {
+        for shell in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+            let snippet = render_shell_init(shell);
+            assert!(snippet.contains("command gtab"));
+        }
+    }
+
+    #[test]
+    fn shell_init_never_routes_the_tui_through_the_dev_tty_clone() {
+        // Regression: macOS kqueue cannot watch the /dev/tty clone device, so
+        // crossterm fails with "Failed to initialize input reader" and the TUI
+        // dies immediately after its first draw. Every snippet must hand gtab
+        // the real terminal device instead.
+        for shell in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+            let snippet = render_shell_init(shell);
+            assert!(
+                !snippet.contains("</dev/tty"),
+                "{shell:?} snippet still reads through the /dev/tty clone"
+            );
+            assert!(
+                !snippet.contains(">/dev/tty "),
+                "{shell:?} snippet still writes through the /dev/tty clone"
+            );
+        }
+
+        // zsh detaches stdin inside zle, so it must resolve the device from $TTY.
+        assert!(render_shell_init(ShellKind::Zsh).contains("${TTY:-"));
+        // bash and fish keep the real tty readline/fish handed them.
+        assert!(render_shell_init(ShellKind::Bash).contains("gtab_tty=$(command tty"));
+        assert!(render_shell_init(ShellKind::Fish).contains("set -l gtab_tty (command tty"));
+    }
+
+    #[test]
+    fn shell_integration_detection_ignores_commented_lines() {
+        let home = tempfile_path("gtab-shell-rc-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".zshrc"), "# eval \"$(gtab shell-init zsh)\"\n").unwrap();
+        assert!(!shell_integration_installed(&home));
+
+        std::fs::write(home.join(".zshrc"), "eval \"$(gtab shell-init zsh)\"\n").unwrap();
+        assert!(shell_integration_installed(&home));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
