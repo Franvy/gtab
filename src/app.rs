@@ -28,12 +28,36 @@ use std::{
 };
 
 const DOUBLE_CLICK_MS: u64 = 350;
-const MIN_WIDTH: u16 = 52;
+const MIN_WIDTH: u16 = 36;
+/// Terminal size at which the shell can spare columns for a decorative margin.
+/// Deliberately independent of `MIN_WIDTH`: a terminal near the minimum needs
+/// every column for content.
+const SHELL_MARGIN_MIN_WIDTH: u16 = 62;
+const SHELL_MARGIN_MIN_HEIGHT: u16 = 21;
+/// Dialogs shrink with the terminal but stop here so their labels stay legible.
+const DIALOG_MIN_WIDTH: u16 = 34;
+const DIALOG_MIN_HEIGHT: u16 = 9;
 const MIN_HEIGHT: u16 = 15;
 const MAIN_LIST_WIDTH: u16 = 24;
-const DIRECTORY_CELL_MIN_WIDTH: u16 = 14;
-const DIRECTORY_CELL_MAX_WIDTH: u16 = 26;
-const DIRECTORY_CELL_GAP: u16 = 2;
+/// Narrowest layout preview that still renders a readable pane map.
+const PREVIEW_MIN_WIDTH: u16 = 30;
+/// Narrowest quick settings column that fits its longest line unwrapped.
+const QUICK_SETTINGS_MIN_WIDTH: u16 = 28;
+/// Rows the workspace list keeps for itself once the preview moves below it.
+const STACKED_LIST_MIN_ROWS: u16 = 4;
+/// Rule, tab header, and the shortest pane map worth drawing.
+const STACKED_PREVIEW_MAP_MIN_ROWS: u16 = 5;
+/// The detail area splits evenly, so both halves must clear the wider minimum.
+const WORKSPACE_COLUMNS_MIN_WIDTH: u16 = MAIN_LIST_WIDTH
+    + 2 * if PREVIEW_MIN_WIDTH > QUICK_SETTINGS_MIN_WIDTH {
+        PREVIEW_MIN_WIDTH
+    } else {
+        QUICK_SETTINGS_MIN_WIDTH
+    };
+const GRID_CELL_MIN_WIDTH: u16 = 6;
+const GRID_CELL_MAX_WIDTH: u16 = 26;
+const GRID_CELL_GAP: u16 = 2;
+const GRID_MAX_COLUMNS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TuiExit {
@@ -404,11 +428,37 @@ struct ClickState {
     at: Instant,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DirectoryGridMetrics {
+#[derive(Clone, Debug)]
+struct GridMetrics {
     columns: usize,
     rows_per_page: usize,
-    cell_width: u16,
+    column_widths: Vec<u16>,
+}
+
+impl GridMetrics {
+    fn column_width(&self, column: usize) -> u16 {
+        self.column_widths
+            .get(column)
+            .copied()
+            .unwrap_or(GRID_CELL_MIN_WIDTH)
+    }
+
+    /// Column index under `offset_x` (relative to the grid origin), or `None`
+    /// when the offset falls in the gap between two columns.
+    fn column_at(&self, offset_x: u16) -> Option<usize> {
+        let mut cursor = 0_u16;
+        for column in 0..self.columns {
+            let width = self.column_width(column);
+            if offset_x < cursor.saturating_add(width) {
+                return Some(column);
+            }
+            cursor = cursor.saturating_add(width).saturating_add(GRID_CELL_GAP);
+            if offset_x < cursor {
+                return None;
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -419,6 +469,9 @@ struct App {
     selected: usize,
     list_offset: usize,
     list_area: Rect,
+    /// Set while drawing: the visible list is laid out as a wrapping grid
+    /// rather than one entry per row.
+    grid_list: bool,
     shortcut_area: Rect,
     last_click: Option<ClickState>,
     filter: String,
@@ -442,6 +495,7 @@ impl App {
             selected: 0,
             list_offset: 0,
             list_area: Rect::default(),
+            grid_list: false,
             shortcut_area: Rect::default(),
             last_click: None,
             filter: String::new(),
@@ -548,6 +602,22 @@ impl App {
                         .contains(&needle)
                         .then_some(index)
                 })
+                .collect(),
+        }
+    }
+
+    /// Grid labels for whichever space is showing.
+    fn visible_labels(&self) -> Vec<String> {
+        match self.mode {
+            BrowserMode::Workspace => self
+                .visible_workspaces()
+                .iter()
+                .map(|workspace| entry_label(&workspace.name))
+                .collect(),
+            BrowserMode::Directory => self
+                .visible_directories()
+                .iter()
+                .map(|directory| entry_label(&directory.name))
                 .collect(),
         }
     }
@@ -689,27 +759,26 @@ impl App {
     }
 
     fn page_step(&self) -> isize {
-        match self.mode {
-            BrowserMode::Workspace => self.list_area.height.saturating_sub(1).max(5) as isize,
-            BrowserMode::Directory => {
-                let metrics = self.directory_grid_metrics();
-                (metrics.columns.saturating_mul(metrics.rows_per_page.max(1))) as isize
-            }
+        if !self.grid_list {
+            return self.list_area.height.saturating_sub(1).max(5) as isize;
         }
+
+        let metrics = self.grid_metrics();
+        (metrics.columns.saturating_mul(metrics.rows_per_page.max(1))) as isize
     }
 
     fn move_vertical_selection(&mut self, direction: isize) {
-        match self.mode {
-            BrowserMode::Workspace => self.move_selection(direction),
-            BrowserMode::Directory => {
-                let metrics = self.directory_grid_metrics();
-                self.move_selection(direction.saturating_mul(metrics.columns.max(1) as isize));
-            }
+        if !self.grid_list {
+            self.move_selection(direction);
+            return;
         }
+
+        let metrics = self.grid_metrics();
+        self.move_selection(direction.saturating_mul(metrics.columns.max(1) as isize));
     }
 
-    fn ensure_directory_selection_visible(&mut self) {
-        if self.mode != BrowserMode::Directory {
+    fn ensure_grid_selection_visible(&mut self) {
+        if !self.grid_list {
             return;
         }
 
@@ -719,10 +788,10 @@ impl App {
             return;
         }
 
-        let metrics = self.directory_grid_metrics();
+        let metrics = self.grid_metrics();
         let selected_row = self.selected / metrics.columns.max(1);
         let max_offset =
-            total_directory_rows(len, metrics.columns).saturating_sub(metrics.rows_per_page);
+            total_grid_rows(len, metrics.columns).saturating_sub(metrics.rows_per_page);
 
         if selected_row < self.list_offset {
             self.list_offset = selected_row;
@@ -737,36 +806,49 @@ impl App {
         self.list_offset = self.list_offset.min(max_offset);
     }
 
-    fn clamp_directory_offset(&mut self) {
-        if self.mode != BrowserMode::Directory {
+    fn clamp_grid_offset(&mut self) {
+        if !self.grid_list {
             return;
         }
 
         let len = self.visible_indices().len();
-        let metrics = self.directory_grid_metrics();
+        let metrics = self.grid_metrics();
         let max_offset =
-            total_directory_rows(len, metrics.columns).saturating_sub(metrics.rows_per_page);
+            total_grid_rows(len, metrics.columns).saturating_sub(metrics.rows_per_page);
         self.list_offset = self.list_offset.min(max_offset);
     }
 
-    fn directory_grid_metrics(&self) -> DirectoryGridMetrics {
+    fn grid_metrics(&self) -> GridMetrics {
         let available_width = self.list_area.width.max(1);
-        let longest_label = self
-            .visible_directories()
+        let rows_per_page = self.list_area.height.max(1) as usize;
+        let labels: Vec<u16> = self
+            .visible_labels()
             .iter()
-            .map(|directory| directory_label(&directory.name).chars().count() as u16)
-            .max()
-            .unwrap_or(DIRECTORY_CELL_MIN_WIDTH);
-        let cell_width = longest_label
-            .clamp(DIRECTORY_CELL_MIN_WIDTH, DIRECTORY_CELL_MAX_WIDTH)
-            .min(available_width);
-        let span = cell_width.saturating_add(DIRECTORY_CELL_GAP).max(1);
-        let columns = ((available_width.saturating_add(DIRECTORY_CELL_GAP)) / span).max(1) as usize;
+            .map(|label| label.chars().count() as u16)
+            .collect();
 
-        DirectoryGridMetrics {
+        let mut columns = grid_column_count(labels.len(), rows_per_page);
+        // Shrink until the widest row fits; a narrow pane simply scrolls.
+        while columns > 1
+            && grid_column_widths(&labels, columns)
+                .iter()
+                .map(|width| u32::from(*width))
+                .sum::<u32>()
+                + u32::from(GRID_CELL_GAP) * (columns as u32 - 1)
+                > u32::from(available_width)
+        {
+            columns -= 1;
+        }
+
+        let column_widths = grid_column_widths(&labels, columns)
+            .into_iter()
+            .map(|width| width.min(available_width))
+            .collect();
+
+        GridMetrics {
             columns,
-            rows_per_page: self.list_area.height.max(1) as usize,
-            cell_width,
+            rows_per_page,
+            column_widths,
         }
     }
 
@@ -1191,11 +1273,11 @@ impl App {
                 self.move_vertical_selection(-1);
                 Ok(Action::None)
             }
-            KeyCode::Right if self.mode == BrowserMode::Directory => {
+            KeyCode::Right if self.grid_list => {
                 self.move_selection(1);
                 Ok(Action::None)
             }
-            KeyCode::Left if self.mode == BrowserMode::Directory => {
+            KeyCode::Left if self.grid_list => {
                 self.move_selection(-1);
                 Ok(Action::None)
             }
@@ -1383,16 +1465,11 @@ impl App {
             return None;
         }
 
-        if self.mode == BrowserMode::Directory {
-            let metrics = self.directory_grid_metrics();
+        if self.grid_list {
+            let metrics = self.grid_metrics();
             let relative_row = row.saturating_sub(self.list_area.y) as usize;
             let relative_x = column.saturating_sub(self.list_area.x);
-            let span = metrics.cell_width.saturating_add(DIRECTORY_CELL_GAP).max(1);
-            let column_index = (relative_x / span) as usize;
-            let inside_cell = (relative_x % span) < metrics.cell_width;
-            if !inside_cell || column_index >= metrics.columns {
-                return None;
-            }
+            let column_index = metrics.column_at(relative_x)?;
 
             let index = (self.list_offset + relative_row)
                 .saturating_mul(metrics.columns)
@@ -1581,6 +1658,89 @@ fn draw_too_small(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     );
 }
 
+/// How the workspace screen arranges its panels for the current width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceLayoutMode {
+    /// list | layout preview | quick settings
+    Columns,
+    /// list | layout preview, quick settings hidden
+    Split,
+    /// layout preview stacked below a full-width list
+    Stacked,
+}
+
+fn workspace_layout_mode(width: u16) -> WorkspaceLayoutMode {
+    if width >= WORKSPACE_COLUMNS_MIN_WIDTH {
+        WorkspaceLayoutMode::Columns
+    } else if width >= MAIN_LIST_WIDTH + PREVIEW_MIN_WIDTH {
+        WorkspaceLayoutMode::Split
+    } else {
+        WorkspaceLayoutMode::Stacked
+    }
+}
+
+/// Rows the stacked layout preview needs, trimmed so the list keeps the larger
+/// share of a short body.
+fn stacked_preview_height(app: &App, body_height: u16) -> u16 {
+    let Some(workspace) = app.selected_workspace() else {
+        return 0;
+    };
+
+    let needed = if workspace.layout.is_empty() {
+        if workspace.tabs.is_empty() {
+            return 0;
+        }
+        // Legacy workspaces fall back to a single-line tab list.
+        1
+    } else {
+        workspace
+            .layout
+            .iter()
+            .map(|tab| {
+                pane_grid_rows(&tab.root)
+                    .saturating_mul(2)
+                    .saturating_add(1)
+                    .max(5)
+                    .saturating_add(2)
+            })
+            .sum::<usize>()
+    };
+
+    // One extra row for the rule that separates the preview from the list.
+    let needed = u16::try_from(needed.saturating_add(1)).unwrap_or(u16::MAX);
+    let cap = body_height.saturating_sub(STACKED_LIST_MIN_ROWS);
+    // Below the rule plus a tab header there is nothing worth showing.
+    if cap < 2 {
+        return 0;
+    }
+    // Too short for a pane map: keep the tab headers and give the rest back to
+    // the list rather than reserving rows that stay blank.
+    if cap < STACKED_PREVIEW_MAP_MIN_ROWS {
+        return 2;
+    }
+
+    needed.min(cap)
+}
+
+/// Rows the stacked workspace grid actually fills, so the preview sits right
+/// below the names instead of at the bottom of a mostly empty pane.
+fn stacked_list_height(app: &mut App, inner: Rect, available: u16) -> u16 {
+    let prompt = u16::from(app.search_active() || !app.filter.is_empty());
+    // grid_metrics() reads list_area, so publish the grid's own rect first.
+    app.list_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(prompt),
+        inner.width,
+        available.saturating_sub(prompt),
+    );
+
+    let columns = app.grid_metrics().columns;
+    let rows = total_grid_rows(app.visible_indices().len(), columns);
+    let rows = u16::try_from(rows).unwrap_or(u16::MAX).max(1);
+
+    rows.saturating_add(prompt).min(available)
+}
+
 fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut App, env: &AppEnv, theme: &Theme) {
     let content = Block::default()
         .borders(Borders::ALL)
@@ -1589,26 +1749,64 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut App, env: &AppEnv, the
     frame.render_widget(content, area);
 
     match app.mode {
-        BrowserMode::Workspace => {
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(MAIN_LIST_WIDTH), Constraint::Min(24)])
-                .split(inner);
+        BrowserMode::Workspace => match workspace_layout_mode(inner.width) {
+            WorkspaceLayoutMode::Stacked => {
+                // Too narrow for side-by-side panels: drop quick settings and
+                // give the layout preview the full width below the list.
+                app.shortcut_area = Rect::default();
+                app.grid_list = true;
+                let preview_height = stacked_preview_height(app, inner.height);
+                let available = inner.height.saturating_sub(preview_height);
+                let list_height = stacked_list_height(app, inner, available);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(list_height),
+                        Constraint::Length(preview_height),
+                        Constraint::Min(0),
+                    ])
+                    .split(inner);
 
-            draw_workspace_list(frame, chunks[0], app, theme);
-            draw_workspace_detail(frame, chunks[1], app, env, theme);
-        }
+                draw_workspace_list(frame, chunks[0], app, theme, Borders::NONE);
+                if preview_height > 0 {
+                    draw_workspace_tabs(frame, chunks[1], app, theme, Borders::TOP);
+                }
+            }
+            mode => {
+                app.grid_list = false;
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(MAIN_LIST_WIDTH),
+                        Constraint::Min(PREVIEW_MIN_WIDTH),
+                    ])
+                    .split(inner);
+
+                draw_workspace_list(frame, chunks[0], app, theme, Borders::RIGHT);
+                if mode == WorkspaceLayoutMode::Columns {
+                    draw_workspace_detail(frame, chunks[1], app, env, theme);
+                } else {
+                    app.shortcut_area = Rect::default();
+                    draw_workspace_tabs(frame, chunks[1], app, theme, Borders::NONE);
+                }
+            }
+        },
         BrowserMode::Directory => {
             app.shortcut_area = Rect::default();
+            app.grid_list = true;
             draw_directory_list(frame, inner, app, theme);
         }
     }
 }
 
-fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
-    let panel = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(theme.border);
+fn draw_workspace_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &Theme,
+    borders: Borders,
+) {
+    let panel = Block::default().borders(borders).border_style(theme.border);
     let inner = panel.inner(area);
     frame.render_widget(panel, area);
 
@@ -1667,6 +1865,13 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
         );
     }
 
+    if app.grid_list {
+        // Stacked layout: the list is full width, so wrap names into columns
+        // instead of burning a row on each one.
+        draw_entry_grid(frame, list_area, app, theme);
+        return;
+    }
+
     let visible = app.visible_workspaces();
     let items: Vec<ListItem<'_>> = if visible.is_empty() {
         vec![ListItem::new(Line::from(vec![Span::styled(
@@ -1677,10 +1882,7 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
         visible
             .iter()
             .map(|workspace| {
-                ListItem::new(Span::styled(
-                    format!("[{}]", workspace.name),
-                    theme.emphasis,
-                ))
+                ListItem::new(Span::styled(entry_label(&workspace.name), theme.emphasis))
             })
             .collect()
     };
@@ -1697,26 +1899,32 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
 
 fn draw_directory_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
     app.list_area = area;
-    app.clamp_directory_offset();
-    app.ensure_directory_selection_visible();
-    let visible = app.visible_directories();
-    let text = if visible.is_empty() {
+    draw_entry_grid(frame, area, app, theme);
+}
+
+/// Wrapping grid of `[name]` cells, shared by directory space and the stacked
+/// workspace list.
+fn draw_entry_grid(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
+    app.clamp_grid_offset();
+    app.ensure_grid_selection_visible();
+    let labels = app.visible_labels();
+    let text = if labels.is_empty() {
         Text::from(vec![Line::from(vec![Span::styled(
             "no matches",
             theme.muted,
         )])])
     } else {
-        directory_grid_text(app, &visible, theme)
+        grid_text(app, &labels, theme)
     };
 
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
 }
 
-fn directory_grid_text(app: &App, visible: &[&SavedDirectory], theme: &Theme) -> Text<'static> {
-    let metrics = app.directory_grid_metrics();
+fn grid_text(app: &App, labels: &[String], theme: &Theme) -> Text<'static> {
+    let metrics = app.grid_metrics();
     let start_row = app.list_offset;
     let start_index = start_row.saturating_mul(metrics.columns);
-    let end_index = visible
+    let end_index = labels
         .len()
         .min(start_index.saturating_add(metrics.columns.saturating_mul(metrics.rows_per_page)));
     let mut lines = Vec::new();
@@ -1726,8 +1934,8 @@ fn directory_grid_text(app: &App, visible: &[&SavedDirectory], theme: &Theme) ->
         let mut spans = Vec::new();
 
         for index in row_start..row_end {
-            let label =
-                fit_directory_cell(&directory_label(&visible[index].name), metrics.cell_width);
+            let column = index - row_start;
+            let label = fit_grid_cell(&labels[index], metrics.column_width(column));
             let style = if index == app.selected {
                 theme.selection
             } else {
@@ -1735,7 +1943,7 @@ fn directory_grid_text(app: &App, visible: &[&SavedDirectory], theme: &Theme) ->
             };
             spans.push(Span::styled(label, style));
             if index + 1 < row_end {
-                spans.push(Span::raw(" ".repeat(DIRECTORY_CELL_GAP as usize)));
+                spans.push(Span::raw(" ".repeat(GRID_CELL_GAP as usize)));
             }
         }
 
@@ -1745,11 +1953,11 @@ fn directory_grid_text(app: &App, visible: &[&SavedDirectory], theme: &Theme) ->
     Text::from(lines)
 }
 
-fn directory_label(name: &str) -> String {
+fn entry_label(name: &str) -> String {
     format!("[{name}]")
 }
 
-fn fit_directory_cell(label: &str, cell_width: u16) -> String {
+fn fit_grid_cell(label: &str, cell_width: u16) -> String {
     let width = cell_width as usize;
     let chars: Vec<char> = label.chars().collect();
     let truncated = if chars.len() > width {
@@ -1770,7 +1978,37 @@ fn fit_directory_cell(label: &str, cell_width: u16) -> String {
     format!("{truncated:<width$}")
 }
 
-fn total_directory_rows(len: usize, columns: usize) -> usize {
+/// Column count for a compact, balanced block: roughly square, widened only
+/// when the entries would not otherwise fit on one page.
+fn grid_column_count(len: usize, rows_per_page: usize) -> usize {
+    if len == 0 {
+        return 1;
+    }
+
+    let balanced = (1..).find(|side| side * side >= len).unwrap_or(1);
+    let to_fit_page = len.div_ceil(rows_per_page.max(1));
+    balanced
+        .max(to_fit_page)
+        .clamp(1, GRID_MAX_COLUMNS.min(len))
+}
+
+/// Width of each column, sized to its own widest entry so short names do not
+/// inherit the padding of the longest one in the grid.
+fn grid_column_widths(labels: &[u16], columns: usize) -> Vec<u16> {
+    let columns = columns.max(1);
+    let mut widths = vec![GRID_CELL_MIN_WIDTH; columns];
+    for (index, label) in labels.iter().enumerate() {
+        let column = index % columns;
+        widths[column] = widths[column].max(*label);
+    }
+
+    widths
+        .into_iter()
+        .map(|width| width.clamp(GRID_CELL_MIN_WIDTH, GRID_CELL_MAX_WIDTH))
+        .collect()
+}
+
+fn total_grid_rows(len: usize, columns: usize) -> usize {
     if len == 0 {
         0
     } else {
@@ -1790,19 +2028,24 @@ fn draw_workspace_detail(
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    draw_workspace_tabs(frame, chunks[0], app, theme);
+    draw_workspace_tabs(frame, chunks[0], app, theme, Borders::RIGHT);
     draw_quick_settings(frame, chunks[1], app, env, theme);
 }
 
-fn draw_workspace_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let panel = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(theme.border);
+fn draw_workspace_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    borders: Borders,
+) {
+    let panel = Block::default().borders(borders).border_style(theme.border);
+    let top_rule = u16::from(borders.contains(Borders::TOP));
     let inner = Rect::new(
         area.x.saturating_add(1),
-        area.y,
+        area.y.saturating_add(top_rule),
         area.width.saturating_sub(2),
-        area.height,
+        area.height.saturating_sub(top_rule),
     );
 
     frame.render_widget(panel, area);
@@ -1873,13 +2116,19 @@ fn workspace_tabs_preview_text(app: &App, width: u16, height: u16, theme: &Theme
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut remaining = height as usize;
-    let map_height = 5_usize;
     let map_width = (width as usize).max(12);
 
     for (index, tab) in workspace.layout.iter().enumerate() {
         if remaining == 0 {
             break;
         }
+
+        // One line per pane row plus the dividers and the outer border, so a
+        // three-row layout is not squeezed into a two-row box.
+        let map_height = pane_grid_rows(&tab.root)
+            .saturating_mul(2)
+            .saturating_add(1)
+            .max(5);
 
         let header = Line::from(vec![
             Span::styled(format!("{:>2}. ", index + 1), theme.dim),
@@ -1888,8 +2137,10 @@ fn workspace_tabs_preview_text(app: &App, width: u16, height: u16, theme: &Theme
         lines.push(header);
         remaining = remaining.saturating_sub(1);
 
-        if remaining >= map_height {
-            let rendered = render_tab_layout_ascii(tab, map_width, map_height);
+        // Shrink rather than skip when the pane is short; a squeezed map falls
+        // back to a pane count instead of vanishing.
+        if remaining >= 3 {
+            let rendered = render_tab_layout_ascii(tab, map_width, map_height.min(remaining));
             for row in rendered {
                 if remaining == 0 {
                     break;
@@ -1925,7 +2176,22 @@ fn render_tab_layout_ascii(tab: &WorkspaceTabLayout, width: usize, height: usize
     }
 
     if width >= 3 && height >= 3 {
-        render_pane_layout_ascii(&tab.root, 1, 1, width - 2, height - 2, &mut buf);
+        let columns = pane_grid_columns(&tab.root);
+        let rows = pane_grid_rows(&tab.root);
+        match (
+            pane_grid_edges(1, width - 2, columns),
+            pane_grid_edges(1, height - 2, rows),
+        ) {
+            (Some(xs), Some(ys)) => {
+                render_pane_layout_ascii(&tab.root, (0, columns), (0, rows), &xs, &ys, &mut buf)
+            }
+            // The map is too small to draw one cell per pane; summarise instead
+            // of dropping panes silently.
+            _ => {
+                let summary = format!("{} panes", pane_leaf_count(&tab.root));
+                draw_centered_label(&summary, 1, 1, width - 2, height - 2, &mut buf);
+            }
+        }
     }
 
     buf.into_iter()
@@ -1933,85 +2199,195 @@ fn render_tab_layout_ascii(tab: &WorkspaceTabLayout, width: usize, height: usize
         .collect()
 }
 
+/// Number of grid columns a pane subtree spans. Sibling panes stacked
+/// vertically share the same columns, so only horizontal splits add width.
+fn pane_grid_columns(layout: &WorkspacePaneLayout) -> usize {
+    match layout {
+        WorkspacePaneLayout::Leaf { .. } => 1,
+        WorkspacePaneLayout::SplitRight { left, right } => {
+            pane_grid_columns(left) + pane_grid_columns(right)
+        }
+        WorkspacePaneLayout::SplitDown { top, bottom } => {
+            pane_grid_columns(top).max(pane_grid_columns(bottom))
+        }
+    }
+}
+
+/// Number of grid rows a pane subtree spans.
+fn pane_grid_rows(layout: &WorkspacePaneLayout) -> usize {
+    match layout {
+        WorkspacePaneLayout::Leaf { .. } => 1,
+        WorkspacePaneLayout::SplitRight { left, right } => {
+            pane_grid_rows(left).max(pane_grid_rows(right))
+        }
+        WorkspacePaneLayout::SplitDown { top, bottom } => {
+            pane_grid_rows(top) + pane_grid_rows(bottom)
+        }
+    }
+}
+
+fn pane_leaf_count(layout: &WorkspacePaneLayout) -> usize {
+    match layout {
+        WorkspacePaneLayout::Leaf { .. } => 1,
+        WorkspacePaneLayout::SplitRight { left, right } => {
+            pane_leaf_count(left) + pane_leaf_count(right)
+        }
+        WorkspacePaneLayout::SplitDown { top, bottom } => {
+            pane_leaf_count(top) + pane_leaf_count(bottom)
+        }
+    }
+}
+
+/// Track edges for `count` evenly sized cells separated by one-character
+/// dividers. Cell `i` covers `edges[i]..edges[i + 1] - 1` and the divider that
+/// follows it sits at `edges[i + 1] - 1`. Returns `None` when `size` cannot fit
+/// one column per pane.
+fn pane_grid_edges(start: usize, size: usize, count: usize) -> Option<Vec<usize>> {
+    let count = count.max(1);
+    let content = size.checked_sub(count - 1)?;
+    if content < count {
+        return None;
+    }
+
+    let base = content / count;
+    let extra = content % count;
+    let mut edges = Vec::with_capacity(count + 1);
+    let mut cursor = start;
+    edges.push(cursor);
+    for index in 0..count {
+        cursor += base + usize::from(index < extra) + 1;
+        edges.push(cursor);
+    }
+
+    Some(edges)
+}
+
 fn render_pane_layout_ascii(
     layout: &WorkspacePaneLayout,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
+    columns: (usize, usize),
+    rows: (usize, usize),
+    xs: &[usize],
+    ys: &[usize],
     buf: &mut [Vec<char>],
 ) {
+    let (first_col, last_col) = columns;
+    let (first_row, last_row) = rows;
+    if last_col <= first_col || last_row <= first_row {
+        return;
+    }
+
+    let x = xs[first_col];
+    let y = ys[first_row];
+    let w = xs[last_col].saturating_sub(1).saturating_sub(x);
+    let h = ys[last_row].saturating_sub(1).saturating_sub(y);
     if w == 0 || h == 0 {
         return;
     }
 
     match layout {
         WorkspacePaneLayout::Leaf { working_dir } => {
-            let label = working_dir_label(working_dir);
-            if h == 0 || w == 0 {
-                return;
-            }
-            let row = y + h / 2;
-            if row >= buf.len() {
-                return;
-            }
-            let fitted = fit_text(&label, w);
-            let start = x + w.saturating_sub(fitted.chars().count()) / 2;
-            for (i, ch) in fitted.chars().enumerate() {
-                let col = start + i;
-                if col >= buf[row].len() {
-                    break;
-                }
-                buf[row][col] = ch;
-            }
+            draw_centered_label(&working_dir_label(working_dir), x, y, w, h, buf);
         }
         WorkspacePaneLayout::SplitRight { left, right } => {
-            // Leave one column for the divider.
-            if w < 3 {
-                render_pane_layout_ascii(left, x, y, w, h, buf);
+            if last_col - first_col < 2 {
+                render_pane_layout_ascii(left, columns, rows, xs, ys, buf);
                 return;
             }
-            let left_w = (w - 1) / 2;
-            let right_w = w - 1 - left_w;
-            let split_x = x + left_w;
 
-            for yy in y..(y + h) {
-                if yy >= buf.len() || split_x >= buf[yy].len() {
-                    continue;
-                }
-                buf[yy][split_x] = match buf[yy][split_x] {
-                    ' ' | '|' => '|',
-                    _ => '+',
-                };
-            }
-
-            render_pane_layout_ascii(left, x, y, left_w, h, buf);
-            render_pane_layout_ascii(right, split_x + 1, y, right_w, h, buf);
+            // Give each subtree the columns it spans so every pane ends up the
+            // same width, instead of halving the remaining space at each level.
+            let split = (first_col + pane_grid_columns(left)).clamp(first_col + 1, last_col - 1);
+            render_pane_layout_ascii(left, (first_col, split), rows, xs, ys, buf);
+            render_pane_layout_ascii(right, (split, last_col), rows, xs, ys, buf);
+            draw_vertical_divider(xs[split].saturating_sub(1), y, h, buf);
         }
         WorkspacePaneLayout::SplitDown { top, bottom } => {
-            // Leave one row for the divider.
-            if h < 3 {
-                render_pane_layout_ascii(top, x, y, w, h, buf);
+            if last_row - first_row < 2 {
+                render_pane_layout_ascii(top, columns, rows, xs, ys, buf);
                 return;
             }
-            let top_h = (h - 1) / 2;
-            let bottom_h = h - 1 - top_h;
-            let split_y = y + top_h;
 
-            if split_y < buf.len() {
-                for xx in x..(x + w) {
-                    if xx >= buf[split_y].len() {
-                        continue;
-                    }
-                    buf[split_y][xx] = match buf[split_y][xx] {
-                        ' ' | '-' => '-',
-                        _ => '+',
-                    };
-                }
-            }
+            let split = (first_row + pane_grid_rows(top)).clamp(first_row + 1, last_row - 1);
+            render_pane_layout_ascii(top, columns, (first_row, split), xs, ys, buf);
+            render_pane_layout_ascii(bottom, columns, (split, last_row), xs, ys, buf);
+            draw_horizontal_divider(ys[split].saturating_sub(1), x, w, buf);
+        }
+    }
+}
 
-            render_pane_layout_ascii(top, x, y, w, top_h, buf);
-            render_pane_layout_ascii(bottom, x, split_y + 1, w, bottom_h, buf);
+fn draw_centered_label(label: &str, x: usize, y: usize, w: usize, h: usize, buf: &mut [Vec<char>]) {
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let row = y + h / 2;
+    if row >= buf.len() {
+        return;
+    }
+
+    // Keep a column of breathing room on each side so long names never run
+    // into the pane dividers.
+    let text_width = if w >= 5 { w - 2 } else { w };
+    let fitted = fit_text(label, text_width);
+    let start = x + w.saturating_sub(fitted.chars().count()) / 2;
+    for (offset, ch) in fitted.chars().enumerate() {
+        let column = start + offset;
+        if column >= buf[row].len() {
+            break;
+        }
+        buf[row][column] = ch;
+    }
+}
+
+fn is_horizontal_rule(ch: char) -> bool {
+    ch == '-' || ch == '+'
+}
+
+fn is_vertical_rule(ch: char) -> bool {
+    ch == '|' || ch == '+'
+}
+
+fn buf_cell(buf: &[Vec<char>], x: usize, y: usize) -> Option<char> {
+    buf.get(y).and_then(|row| row.get(x)).copied()
+}
+
+fn draw_vertical_divider(x: usize, y: usize, h: usize, buf: &mut [Vec<char>]) {
+    for row in y..y.saturating_add(h) {
+        if buf_cell(buf, x, row).is_none() {
+            continue;
+        }
+        let crosses = x > 0 && buf_cell(buf, x - 1, row).is_some_and(is_horizontal_rule)
+            || buf_cell(buf, x + 1, row).is_some_and(is_horizontal_rule);
+        buf[row][x] = if crosses { '+' } else { '|' };
+    }
+
+    // Join the divider to whatever encloses it (outer border or parent rule).
+    for row in [y.checked_sub(1), Some(y.saturating_add(h))]
+        .into_iter()
+        .flatten()
+    {
+        if buf_cell(buf, x, row).is_some_and(is_horizontal_rule) {
+            buf[row][x] = '+';
+        }
+    }
+}
+
+fn draw_horizontal_divider(y: usize, x: usize, w: usize, buf: &mut [Vec<char>]) {
+    for column in x..x.saturating_add(w) {
+        if buf_cell(buf, column, y).is_none() {
+            continue;
+        }
+        let crosses = y > 0 && buf_cell(buf, column, y - 1).is_some_and(is_vertical_rule)
+            || buf_cell(buf, column, y + 1).is_some_and(is_vertical_rule);
+        buf[y][column] = if crosses { '+' } else { '-' };
+    }
+
+    for column in [x.checked_sub(1), Some(x.saturating_add(w))]
+        .into_iter()
+        .flatten()
+    {
+        if buf_cell(buf, column, y).is_some_and(is_vertical_rule) {
+            buf[y][column] = '+';
         }
     }
 }
@@ -2533,8 +2909,16 @@ fn draw_dialog_shell(
 }
 
 fn shell_rect(area: Rect) -> Rect {
-    let horizontal_margin = if area.width >= MIN_WIDTH + 10 { 2 } else { 0 };
-    let vertical_margin = if area.height >= MIN_HEIGHT + 6 { 1 } else { 0 };
+    let horizontal_margin = if area.width >= SHELL_MARGIN_MIN_WIDTH {
+        2
+    } else {
+        0
+    };
+    let vertical_margin = if area.height >= SHELL_MARGIN_MIN_HEIGHT {
+        1
+    } else {
+        0
+    };
 
     Rect::new(
         area.x.saturating_add(horizontal_margin),
@@ -2602,24 +2986,24 @@ fn fit_text(text: &str, max_width: usize) -> String {
     format!("{prefix}...")
 }
 
+/// Centred popup sized as a share of `area`, but never squeezed below the
+/// point where its labels stop being readable on a small terminal.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
+    let width = scaled_dialog_side(area.width, percent_x, DIALOG_MIN_WIDTH);
+    let height = scaled_dialog_side(area.height, percent_y, DIALOG_MIN_HEIGHT);
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+fn scaled_dialog_side(available: u16, percent: u16, minimum: u16) -> u16 {
+    let scaled = (u32::from(available) * u32::from(percent) / 100) as u16;
+    scaled.clamp(minimum.min(available), available)
 }
 
 fn display_path(path: &Path) -> String {
@@ -2752,7 +3136,7 @@ fn shortcut_key_name_for_char(c: char) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Config, WorkspaceTab};
+    use crate::core::{Config, WorkspacePaneLayout, WorkspaceTab, WorkspaceTabLayout};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use std::path::PathBuf;
 
@@ -2907,9 +3291,10 @@ mod tests {
             directory("notes", "/tmp/notes"),
         ];
         app.mode = BrowserMode::Directory;
+        app.grid_list = true;
         app.list_area = Rect::new(0, 0, 40, 4);
 
-        let text = directory_grid_text(&app, &app.visible_directories(), &theme);
+        let text = grid_text(&app, &app.visible_labels(), &theme);
         let lines = text_lines(text);
 
         assert_eq!(lines.len(), 2);
@@ -2927,10 +3312,13 @@ mod tests {
             directory("notes", "/tmp/notes"),
         ];
         app.mode = BrowserMode::Directory;
+        app.grid_list = true;
         app.list_area = Rect::new(0, 0, 40, 4);
 
-        assert_eq!(app.list_index_at(16, 0), Some(1));
-        assert_eq!(app.list_index_at(14, 0), None);
+        // Two columns: "[docs]"/"[notes]" (7 wide) then a 2 column gap.
+        assert_eq!(app.list_index_at(0, 0), Some(0));
+        assert_eq!(app.list_index_at(9, 0), Some(1));
+        assert_eq!(app.list_index_at(7, 0), None);
     }
 
     #[test]
@@ -2943,6 +3331,7 @@ mod tests {
             directory("play", "/tmp/play"),
         ];
         app.mode = BrowserMode::Directory;
+        app.grid_list = true;
         app.list_area = Rect::new(0, 0, 40, 4);
 
         assert_eq!(
@@ -3408,14 +3797,16 @@ mod tests {
         let mut app = app(vec![workspace("alpha")]);
         app.directories = vec![directory("docs", "/tmp/docs"), directory("tmp", "/tmp")];
         app.mode = BrowserMode::Directory;
+        app.grid_list = true;
         app.list_area = Rect::new(0, 0, 40, 6);
 
+        // "[docs]" fills the first six columns, then a two column gap.
         assert_eq!(
-            app.handle_mouse(left_click(16, 0), &env()).unwrap(),
+            app.handle_mouse(left_click(8, 0), &env()).unwrap(),
             Action::None
         );
         assert_eq!(
-            app.handle_mouse(left_click(16, 0), &env()).unwrap(),
+            app.handle_mouse(left_click(8, 0), &env()).unwrap(),
             Action::ReplaceDirectory(PathBuf::from("/tmp"))
         );
     }
@@ -3433,5 +3824,614 @@ mod tests {
         );
         assert_eq!(app.dialog, Dialog::RenameDirectory);
         assert_eq!(app.rename_original.as_deref(), Some("docs"));
+    }
+
+    fn leaf(working_dir: &str) -> WorkspacePaneLayout {
+        WorkspacePaneLayout::Leaf {
+            working_dir: working_dir.to_string(),
+        }
+    }
+
+    fn split_right(left: WorkspacePaneLayout, right: WorkspacePaneLayout) -> WorkspacePaneLayout {
+        WorkspacePaneLayout::SplitRight {
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    fn split_down(top: WorkspacePaneLayout, bottom: WorkspacePaneLayout) -> WorkspacePaneLayout {
+        WorkspacePaneLayout::SplitDown {
+            top: Box::new(top),
+            bottom: Box::new(bottom),
+        }
+    }
+
+    fn tab_layout(root: WorkspacePaneLayout) -> WorkspaceTabLayout {
+        WorkspaceTabLayout {
+            title: "operation".to_string(),
+            root,
+        }
+    }
+
+    /// Widths of the cells between the vertical rules on a rendered row.
+    fn column_widths(row: &str) -> Vec<usize> {
+        row.trim_matches(|c| c == '+' || c == '|')
+            .split(['|', '+'])
+            .map(|cell| cell.chars().count())
+            .collect()
+    }
+
+    #[test]
+    fn pane_preview_gives_every_column_the_same_width() {
+        // Regression: nested right splits used to halve the remaining space at
+        // each level, so three panes rendered as 50% / 25% / 25%.
+        let tab = tab_layout(split_right(
+            leaf("/x/one"),
+            split_right(leaf("/x/two"), leaf("/x/three")),
+        ));
+
+        let rendered = render_tab_layout_ascii(&tab, 56, 5);
+        let widths = column_widths(&rendered[2]);
+
+        assert_eq!(widths.len(), 3, "expected three columns in {:?}", rendered);
+        let min = widths.iter().min().copied().unwrap();
+        let max = widths.iter().max().copied().unwrap();
+        assert!(
+            max - min <= 1,
+            "columns should be evenly distributed, got {widths:?}"
+        );
+    }
+
+    #[test]
+    fn pane_preview_keeps_a_stacked_column_half_width() {
+        // A pane split vertically still occupies a single grid column, so the
+        // map stays 50/50 instead of shrinking the stacked side.
+        let tab = tab_layout(split_right(
+            leaf("/x/one"),
+            split_down(leaf("/x/two"), leaf("/x/three")),
+        ));
+
+        let rendered = render_tab_layout_ascii(&tab, 56, 5);
+        let widths = column_widths(&rendered[1]);
+
+        assert_eq!(widths.len(), 2, "expected two columns in {:?}", rendered);
+        assert!(
+            widths[0].abs_diff(widths[1]) <= 1,
+            "stacked column should keep half the width, got {widths:?}"
+        );
+    }
+
+    #[test]
+    fn pane_preview_renders_every_row_of_a_three_way_stack() {
+        // Regression: the map was a fixed five lines tall, so the third pane of
+        // a vertical stack was dropped from the preview entirely.
+        let tab = tab_layout(split_down(
+            leaf("/x/one"),
+            split_down(leaf("/x/two"), leaf("/x/three")),
+        ));
+
+        let height = pane_grid_rows(&tab.root) * 2 + 1;
+        let rendered = render_tab_layout_ascii(&tab, 40, height);
+        let joined = rendered.join("\n");
+
+        for name in ["one", "two", "three"] {
+            assert!(joined.contains(name), "missing {name} in\n{joined}");
+        }
+    }
+
+    #[test]
+    fn pane_preview_height_follows_the_row_count() {
+        assert_eq!(pane_grid_rows(&leaf("/x/one")), 1);
+        assert_eq!(
+            pane_grid_rows(&split_right(leaf("/x/one"), leaf("/x/two"))),
+            1
+        );
+        assert_eq!(
+            pane_grid_rows(&split_down(
+                leaf("/x/one"),
+                split_down(leaf("/x/two"), leaf("/x/three"))
+            )),
+            3
+        );
+        assert_eq!(
+            pane_grid_columns(&split_right(
+                leaf("/x/one"),
+                split_down(leaf("/x/two"), leaf("/x/three"))
+            )),
+            2
+        );
+    }
+
+    #[test]
+    fn pane_preview_labels_keep_clear_of_the_dividers() {
+        let tab = tab_layout(split_right(
+            leaf("/x/a-very-long-directory-name"),
+            leaf("/x/two"),
+        ));
+
+        let rendered = render_tab_layout_ascii(&tab, 40, 5);
+        for row in &rendered[1..rendered.len() - 1] {
+            let chars: Vec<char> = row.chars().collect();
+            for (index, ch) in chars.iter().enumerate() {
+                if *ch != '|' {
+                    continue;
+                }
+                if let Some(next) = chars.get(index + 1) {
+                    assert!(
+                        *next == ' ' || *next == '|',
+                        "label touches a divider in {row:?}"
+                    );
+                }
+                if index > 0 {
+                    let previous = chars[index - 1];
+                    assert!(
+                        previous == ' ' || previous == '|',
+                        "label touches a divider in {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pane_preview_summarises_when_the_map_is_too_narrow() {
+        let mut root = leaf("/x/0");
+        for index in 1..12 {
+            root = split_right(root, leaf(&format!("/x/{index}")));
+        }
+
+        let rendered = render_tab_layout_ascii(&tab_layout(root), 14, 5);
+        assert!(
+            rendered.join("\n").contains("12 panes"),
+            "expected a pane count fallback in\n{}",
+            rendered.join("\n")
+        );
+    }
+
+    #[test]
+    fn directory_grid_stays_compact_instead_of_spanning_the_pane() {
+        // Regression: the grid used one global cell width and as many columns
+        // as the pane could hold, so a short list spread edge to edge with a
+        // ragged final row and wide gaps after short names.
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = [
+            "blog",
+            "design-limns",
+            "gtab",
+            "kage",
+            "limns",
+            "limns-admin",
+            "md",
+            "new",
+            "paper",
+            "reel",
+            "tag-data",
+            "video",
+        ]
+        .into_iter()
+        .map(|name| directory(name, "/tmp"))
+        .collect();
+        app.mode = BrowserMode::Directory;
+        app.grid_list = true;
+        app.list_area = Rect::new(0, 0, 142, 13);
+
+        let metrics = app.grid_metrics();
+        assert_eq!(metrics.columns, 4);
+
+        let theme = Theme::detect();
+        let lines = text_lines(grid_text(&app, &app.visible_labels(), &theme));
+        assert_eq!(lines.len(), 3, "expected a balanced 4x3 block: {lines:?}");
+        assert!(
+            lines[0].trim_end().chars().count() < 50,
+            "grid should stay compact, got {:?}",
+            lines[0]
+        );
+        // Columns are sized per column, so a short name is not padded out to
+        // the width of the longest entry in the whole grid.
+        assert!(
+            lines[1].starts_with("[limns]  [limns-admin]"),
+            "unexpected column widths: {:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn directory_grid_columns_stay_aligned_across_rows() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = ["a", "bbbbbbbbbbbb", "c", "d", "e", "f"]
+            .into_iter()
+            .map(|name| directory(name, "/tmp"))
+            .collect();
+        app.mode = BrowserMode::Directory;
+        app.grid_list = true;
+        app.list_area = Rect::new(0, 0, 60, 10);
+
+        let theme = Theme::detect();
+        let lines = text_lines(grid_text(&app, &app.visible_labels(), &theme));
+        let offsets: Vec<Vec<usize>> = lines
+            .iter()
+            .map(|line| line.match_indices('[').map(|(index, _)| index).collect())
+            .collect();
+
+        assert!(offsets.len() > 1);
+        for row in &offsets[1..] {
+            assert_eq!(*row, offsets[0], "columns drifted between rows: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn directory_grid_adds_columns_when_a_page_cannot_hold_the_list() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = (0..40)
+            .map(|index| directory(&format!("dir{index}"), "/tmp"))
+            .collect();
+        app.mode = BrowserMode::Directory;
+        app.grid_list = true;
+        app.list_area = Rect::new(0, 0, 120, 6);
+
+        let metrics = app.grid_metrics();
+        assert!(
+            total_grid_rows(40, metrics.columns) <= metrics.rows_per_page,
+            "expected the list to fit one page, got {} columns",
+            metrics.columns
+        );
+    }
+
+    fn workspace_with_layout(name: &str, root: WorkspacePaneLayout) -> Workspace {
+        let mut workspace = workspace(name);
+        workspace.layout = vec![tab_layout(root)];
+        workspace
+    }
+
+    fn render_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let app_env = env();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app, &app_env)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn row_index(rows: &[String], needle: &str) -> Option<usize> {
+        rows.iter().position(|row| row.contains(needle))
+    }
+
+    #[test]
+    fn workspace_layout_mode_switches_on_width() {
+        assert_eq!(
+            workspace_layout_mode(WORKSPACE_COLUMNS_MIN_WIDTH),
+            WorkspaceLayoutMode::Columns
+        );
+        assert_eq!(
+            workspace_layout_mode(WORKSPACE_COLUMNS_MIN_WIDTH - 1),
+            WorkspaceLayoutMode::Split
+        );
+        assert_eq!(
+            workspace_layout_mode(MAIN_LIST_WIDTH + PREVIEW_MIN_WIDTH),
+            WorkspaceLayoutMode::Split
+        );
+        assert_eq!(
+            workspace_layout_mode(MAIN_LIST_WIDTH + PREVIEW_MIN_WIDTH - 1),
+            WorkspaceLayoutMode::Stacked
+        );
+    }
+
+    #[test]
+    fn narrow_workspace_screen_stacks_the_preview_below_the_list() {
+        // Regression: the three column layout was kept at every width, so at
+        // the minimum terminal size the pane map was squeezed into ~10 columns.
+        let mut app = app(vec![workspace_with_layout(
+            "alpha",
+            split_right(
+                leaf("/x/one"),
+                split_right(leaf("/x/two"), leaf("/x/three")),
+            ),
+        )]);
+
+        // 52 columns was the old hard floor and is still too narrow for the
+        // side-by-side panels.
+        let rows = render_rows(&mut app, 52, 18);
+        let joined = rows.join("\n");
+
+        assert!(
+            !joined.contains("QUICK SETTINGS"),
+            "quick settings should be hidden when narrow:\n{joined}"
+        );
+
+        let list_row = row_index(&rows, "[alpha]").expect("workspace list");
+        let header_row = row_index(&rows, "1. operation").expect("preview header");
+        assert!(
+            header_row > list_row,
+            "preview should sit below the list:\n{joined}"
+        );
+
+        // The map now gets the full body width instead of a squeezed column.
+        let map_row = rows
+            .iter()
+            .find(|row| row.contains("one") && row.contains("three"))
+            .expect("pane map");
+        let widths = column_widths(map_row.trim().trim_matches('\u{2502}').trim());
+        assert_eq!(widths.len(), 3, "expected three panes in {map_row:?}");
+        assert!(
+            widths.iter().all(|width| *width >= 10),
+            "panes should be readable, got {widths:?}"
+        );
+    }
+
+    #[test]
+    fn medium_workspace_screen_keeps_the_preview_beside_the_list() {
+        let mut app = app(vec![workspace_with_layout(
+            "alpha",
+            split_right(leaf("/x/one"), leaf("/x/two")),
+        )]);
+
+        let width = MAIN_LIST_WIDTH + PREVIEW_MIN_WIDTH + 8;
+        let rows = render_rows(&mut app, width, 18);
+        let joined = rows.join("\n");
+
+        assert!(
+            !joined.contains("QUICK SETTINGS"),
+            "quick settings should be hidden before the preview shrinks:\n{joined}"
+        );
+        assert_eq!(
+            row_index(&rows, "[alpha]"),
+            row_index(&rows, "1. operation"),
+            "list and preview should share a row:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn wide_workspace_screen_keeps_all_three_columns() {
+        let mut app = app(vec![workspace_with_layout(
+            "alpha",
+            split_right(leaf("/x/one"), leaf("/x/two")),
+        )]);
+
+        let rows = render_rows(&mut app, 120, 18);
+        let joined = rows.join("\n");
+
+        assert!(joined.contains("QUICK SETTINGS"), "{joined}");
+        // The longest quick settings line must not wrap at this width.
+        assert!(joined.contains("same-shell in Ghostty"), "{joined}");
+        assert!(joined.contains("shortcut cmd+g"), "{joined}");
+    }
+
+    #[test]
+    fn hiding_quick_settings_clears_its_click_target() {
+        let mut app = app(vec![workspace_with_layout("alpha", leaf("/x/one"))]);
+
+        let _ = render_rows(&mut app, 120, 18);
+        assert_ne!(app.shortcut_area, Rect::default());
+
+        let _ = render_rows(&mut app, 52, 18);
+        assert_eq!(
+            app.shortcut_area,
+            Rect::default(),
+            "a hidden shortcut row must not stay clickable"
+        );
+    }
+
+    #[test]
+    fn stacked_preview_leaves_the_list_usable() {
+        let mut app = app(vec![workspace_with_layout(
+            "alpha",
+            split_down(leaf("/x/one"), split_down(leaf("/x/two"), leaf("/x/three"))),
+        )]);
+        app.selected = 0;
+
+        for body_height in 6..40_u16 {
+            let preview = stacked_preview_height(&app, body_height);
+            assert!(
+                preview <= body_height.saturating_sub(STACKED_LIST_MIN_ROWS),
+                "preview {preview} left too little room in {body_height} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn dialogs_stop_shrinking_before_they_become_unreadable() {
+        let small = Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT);
+        let dialog = centered_rect(58, 34, small);
+
+        assert_eq!(dialog.width, DIALOG_MIN_WIDTH);
+        assert!(dialog.width <= small.width);
+        assert_eq!(dialog.height, DIALOG_MIN_HEIGHT);
+        assert!(dialog.height <= small.height);
+        assert!(dialog.right() <= small.right());
+        assert!(dialog.bottom() <= small.bottom());
+    }
+
+    #[test]
+    fn dialogs_never_exceed_a_terminal_narrower_than_the_minimum() {
+        let tiny = Rect::new(0, 0, DIALOG_MIN_WIDTH - 10, DIALOG_MIN_HEIGHT - 3);
+        let dialog = centered_rect(58, 34, tiny);
+
+        assert_eq!(dialog.width, tiny.width);
+        assert_eq!(dialog.height, tiny.height);
+    }
+
+    #[test]
+    fn dialogs_keep_their_share_of_a_roomy_terminal() {
+        let area = Rect::new(0, 0, 150, 40);
+        let dialog = centered_rect(58, 34, area);
+
+        assert_eq!(dialog.width, 87);
+        assert_eq!(dialog.height, 13);
+        assert_eq!(dialog.x, (150 - 87) / 2);
+        assert_eq!(dialog.y, (40 - 13) / 2);
+    }
+
+    #[test]
+    fn the_minimum_terminal_still_renders_list_preview_and_footer() {
+        // The stacked layout works far below the old 52 column floor, so the
+        // resize notice should not take over at sizes the UI can handle.
+        let mut app = app(vec![workspace_with_layout(
+            "alpha",
+            split_right(leaf("/x/one"), leaf("/x/two")),
+        )]);
+
+        let rows = render_rows(&mut app, MIN_WIDTH, MIN_HEIGHT);
+        let joined = rows.join("\n");
+
+        assert!(!joined.contains("needs more room"), "{joined}");
+        assert!(joined.contains("[alpha]"), "{joined}");
+        assert!(joined.contains("1. operation"), "{joined}");
+        // The footer keeps its status line and key hints.
+        assert!(joined.contains("[i]"), "{joined}");
+        assert!(joined.contains("Enter launch"), "{joined}");
+    }
+
+    #[test]
+    fn terminals_below_the_minimum_still_get_the_resize_notice() {
+        let mut app = app(vec![workspace("alpha")]);
+
+        let rows = render_rows(&mut app, MIN_WIDTH - 1, MIN_HEIGHT);
+        assert!(rows.join("\n").contains("needs more room"));
+    }
+
+    fn grid_workspaces() -> Vec<Workspace> {
+        ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+            .into_iter()
+            .map(workspace)
+            .collect()
+    }
+
+    #[test]
+    fn stacked_workspace_list_wraps_names_into_columns() {
+        let mut app = app(grid_workspaces());
+
+        let rows = render_rows(&mut app, 49, 24);
+        let joined = rows.join("\n");
+        let first = rows
+            .iter()
+            .find(|row| row.contains("[alpha]"))
+            .expect("workspace names");
+
+        assert!(
+            first.contains("[beta]"),
+            "names should share a row when stacked:\n{joined}"
+        );
+        assert!(app.grid_list);
+    }
+
+    #[test]
+    fn wide_workspace_list_keeps_one_name_per_row() {
+        let mut app = app(grid_workspaces());
+
+        let rows = render_rows(&mut app, 120, 24);
+        let first = rows
+            .iter()
+            .find(|row| row.contains("[alpha]"))
+            .expect("workspace names");
+
+        assert!(
+            !first.contains("[beta]"),
+            "the 24 column list should stay vertical: {first:?}"
+        );
+        assert!(!app.grid_list);
+    }
+
+    #[test]
+    fn stacked_workspace_grid_moves_by_column_and_by_cell() {
+        let mut app = app(grid_workspaces());
+        let _ = render_rows(&mut app, 49, 24);
+
+        let columns = app.grid_metrics().columns;
+        assert!(columns > 1, "expected a multi column grid");
+
+        app.selected = 0;
+        app.handle_main_key(KeyEvent::from(KeyCode::Down), &env())
+            .unwrap();
+        assert_eq!(app.selected, columns, "Down should move a whole row");
+
+        app.selected = 0;
+        app.handle_main_key(KeyEvent::from(KeyCode::Right), &env())
+            .unwrap();
+        assert_eq!(app.selected, 1, "Right should move one cell");
+
+        app.handle_main_key(KeyEvent::from(KeyCode::Left), &env())
+            .unwrap();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn stacked_workspace_grid_maps_clicks_to_the_right_cell() {
+        let mut app = app(grid_workspaces());
+        let _ = render_rows(&mut app, 49, 24);
+
+        let metrics = app.grid_metrics();
+        let origin = app.list_area.x;
+        let second_column = origin + metrics.column_width(0) + GRID_CELL_GAP;
+
+        assert_eq!(app.list_index_at(origin, app.list_area.y), Some(0));
+        assert_eq!(app.list_index_at(second_column, app.list_area.y), Some(1));
+        assert_eq!(
+            app.list_index_at(origin, app.list_area.y + 1),
+            Some(metrics.columns)
+        );
+    }
+
+    #[test]
+    fn stacked_list_sits_directly_above_the_preview() {
+        // Regression: the preview was pinned to the bottom of the body, so a
+        // short grid left a large hole in the middle of the screen.
+        let mut app = app(vec![workspace_with_layout(
+            "alpha",
+            split_right(leaf("/x/one"), leaf("/x/two")),
+        )]);
+
+        let rows = render_rows(&mut app, 49, 30);
+        let joined = rows.join("\n");
+        let header = row_index(&rows, "1. operation").expect("preview header");
+
+        assert!(header >= 2, "{joined}");
+        assert!(
+            rows[header - 2].contains("[alpha]"),
+            "the rule should follow the last name row:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn stacked_grid_column_count_is_stable_across_frames() {
+        // grid_metrics() reads list_area, which the stacked layout sizes from
+        // grid_metrics(); the feedback loop must settle immediately.
+        let mut app = app(grid_workspaces());
+
+        let _ = render_rows(&mut app, 49, 24);
+        let first = app.grid_metrics().columns;
+        let first_area = app.list_area;
+
+        let _ = render_rows(&mut app, 49, 24);
+        assert_eq!(app.grid_metrics().columns, first);
+        assert_eq!(app.list_area, first_area);
+    }
+
+    #[test]
+    fn the_shell_margin_only_appears_when_columns_are_to_spare() {
+        // Regression: the margin threshold used to be MIN_WIDTH + 10, so
+        // lowering MIN_WIDTH quietly started spending four columns on
+        // decoration exactly where the stacked layout needs them.
+        let narrow = shell_rect(Rect::new(0, 0, SHELL_MARGIN_MIN_WIDTH - 1, 30));
+        assert_eq!(narrow.x, 0);
+        assert_eq!(narrow.width, SHELL_MARGIN_MIN_WIDTH - 1);
+
+        let roomy = shell_rect(Rect::new(0, 0, SHELL_MARGIN_MIN_WIDTH, 30));
+        assert_eq!(roomy.x, 2);
+        assert_eq!(roomy.width, SHELL_MARGIN_MIN_WIDTH - 4);
+
+        let minimum = shell_rect(Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT));
+        assert_eq!(
+            minimum.width, MIN_WIDTH,
+            "the minimum size keeps every column"
+        );
+        assert_eq!(minimum.height, MIN_HEIGHT);
     }
 }
