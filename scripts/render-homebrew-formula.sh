@@ -60,7 +60,10 @@ class Gtab < Formula
     assert_match "demo", shell_output("#{bin}/gtab list")
     assert_match "close_tab = off", shell_output("#{bin}/gtab set")
     assert_match "ghostty_shortcut = cmd+g", shell_output("#{bin}/gtab set")
-    assert_match "Ghostty-local shortcut is the default fast path", shell_output("#{bin}/gtab set")
+    assert_match "shortcut_mode = text", shell_output("#{bin}/gtab set")
+
+    assert_match "_gtab_launch_widget", shell_output("#{bin}/gtab shell-init zsh")
+    assert_match "unsupported shell", shell_output("#{bin}/gtab shell-init tcsh 2>&1", 1)
 
     system bin/"gtab", "set", "close_tab", "on"
     assert_match "close_tab = on", shell_output("#{bin}/gtab set")
