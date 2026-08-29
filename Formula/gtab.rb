@@ -2,8 +2,8 @@ class Gtab < Formula
   desc "Ghostty tab workspace manager with an interactive TUI"
   homepage "https://github.com/Franvy/gtab"
   url "https://github.com/Franvy/gtab.git",
-      tag: "v1.7.0"
-  version "1.7.0"
+      tag: "v1.8.0"
+  version "1.8.0"
   license "MIT"
   head "https://github.com/Franvy/gtab.git", branch: "main"
 
