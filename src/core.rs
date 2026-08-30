@@ -133,7 +133,7 @@ pub struct WorkspaceTab {
     pub working_dir: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspacePaneLayout {
     Leaf {
         working_dir: String,
@@ -1305,8 +1305,49 @@ end tell"#,
     let normalized = serialize_captured_tab_surfaces(&captured);
 
     // Phase 2: reconstruct split trees from positions and generate restore script
-    let py = r#"import sys
+    generate_workspace_script(&normalized)
+}
+
+/// Rebuilds the split tree from captured pane geometry and renders the restore script.
+fn generate_workspace_script(normalized: &str) -> Result<String> {
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(WORKSPACE_SCRIPT_GENERATOR_PY)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn python3 for workspace script generation")?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to open python3 stdin")?;
+        stdin
+            .write_all(normalized.as_bytes())
+            .context("failed to write tab data to python3")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for python3")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("failed to generate workspace script: {stderr}");
+    }
+
+    String::from_utf8(output.stdout).context("python3 output was not valid UTF-8")
+}
+
+/// Reads the captured `tab\tpane\tid\twd\ttitle\tx,y,w,h` rows from stdin and prints the
+/// AppleScript that recreates the same tabs, splits, and pane proportions.
+const WORKSPACE_SCRIPT_GENERATOR_PY: &str = r#"import sys
 from collections import defaultdict
+
+# Pane rects exclude dividers and padding, so measured ratios drift slightly.
+EQUALIZE_TOLERANCE = 0.03
 
 def esc(s):
     return s.replace('\\', '\\\\').replace('"', '\\"')
@@ -1315,6 +1356,50 @@ def get_anchor(tree):
     if tree['t'] == 'leaf': return tree['p']
     if tree['t'] == 'v':    return get_anchor(tree['l'])
     return get_anchor(tree['T'])
+
+def children(tree):
+    # (first child, second child, axis origin key, axis size key)
+    if tree['t'] == 'leaf': return None
+    if tree['t'] == 'v':    return tree['l'], tree['r'], 'x', 'w'
+    return tree['T'], tree['B'], 'y', 'h'
+
+def leaves(tree):
+    kids = children(tree)
+    if kids is None: return [tree['p']]
+    return leaves(kids[0]) + leaves(kids[1])
+
+def span(tree, lo, size):
+    ls = leaves(tree)
+    return max(p[lo] + p[size] for p in ls) - min(p[lo] for p in ls)
+
+def weight(tree, direction):
+    # Mirrors Ghostty's equalize weighting: same-direction splits contribute
+    # their full weight, splits along the other axis count as one.
+    if tree['t'] != direction: return 1
+    a, b, _, _ = children(tree)
+    return weight(a, direction) + weight(b, direction)
+
+def equalized_ratio(tree):
+    a, b, _, _ = children(tree)
+    wa, wb = weight(a, tree['t']), weight(b, tree['t'])
+    return wa / (wa + wb)
+
+def is_equalized(tree):
+    # True when every divider already sits where equalize_splits would put it.
+    kids = children(tree)
+    if kids is None: return True
+    a, b, lo, size = kids
+    sa, sb = span(a, lo, size), span(b, lo, size)
+    if sa + sb <= 0: return False
+    if abs(sa / (sa + sb) - equalized_ratio(tree)) > EQUALIZE_TOLERANCE: return False
+    return is_equalized(a) and is_equalized(b)
+
+def needs_equalize(tree):
+    # Splits are created 50/50, so only uneven weights need a correction.
+    kids = children(tree)
+    if kids is None: return False
+    if abs(equalized_ratio(tree) - 0.5) > 1e-9: return True
+    return needs_equalize(kids[0]) or needs_equalize(kids[1])
 
 def reconstruct(panes):
     if len(panes) == 1:
@@ -1392,41 +1477,12 @@ for i, ti in enumerate(sorted(tabs.keys())):
     if tab['title']:
         out.append(f'    perform action "set_tab_title:{esc(tab["title"])}" on {fv}')
     c = gen(tree, fv, out, c)
+    if needs_equalize(tree) and is_equalized(tree):
+        out.append(f'    perform action "equalize_splits" on {fv}')
 
 out.append('end tell')
 print('\n'.join(out))
 "#;
-
-    let mut child = Command::new("python3")
-        .arg("-c")
-        .arg(py)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn python3 for workspace script generation")?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("failed to open python3 stdin")?;
-        stdin
-            .write_all(normalized.as_bytes())
-            .context("failed to write tab data to python3")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("failed to wait for python3")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("failed to generate workspace script: {stderr}");
-    }
-
-    String::from_utf8(output.stdout).context("python3 output was not valid UTF-8")
-}
 
 fn parse_captured_tab_surfaces(raw: &str) -> Vec<CapturedTabSurface> {
     raw.lines().filter_map(parse_captured_tab_surface).collect()
@@ -2421,17 +2477,19 @@ pub fn format_settings(env: &AppEnv) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::WorkspacePaneLayout;
     use super::{
         AppEnv, Config, GhosttyConfigSync, GhosttyShortcutApplyStatus, ShellKind, ShortcutMode,
         TabRow, WindowFrame, WorkspaceLaunchMode, apple_escape, build_ghostty_cd_script,
         build_ghostty_replace_directory_script, build_ghostty_shortcut_include,
-        build_workspace_script, format_workspace_list, looks_like_shell_default_title,
-        normalize_captured_tab_title, normalize_shortcut_mode, parse_shell_kind,
-        parse_window_frame, parse_workspace_rows, parse_workspace_tabs, plan_workspace_launch,
-        render_ghostty_direct_cd_command, render_ghostty_include_config_line,
-        render_shell_cd_command, render_shell_init, shell_integration_installed,
-        should_switch_to_ascii_input_source, sync_ghostty_include_reference,
-        validate_workspace_name, workspace_requires_true_legacy_launch,
+        build_workspace_script, format_workspace_list, generate_workspace_script,
+        looks_like_shell_default_title, normalize_captured_tab_title, normalize_shortcut_mode,
+        parse_shell_kind, parse_window_frame, parse_workspace_layout, parse_workspace_rows,
+        parse_workspace_tabs, plan_workspace_launch, render_ghostty_direct_cd_command,
+        render_ghostty_include_config_line, render_shell_cd_command, render_shell_init,
+        shell_integration_installed, should_switch_to_ascii_input_source,
+        sync_ghostty_include_reference, validate_workspace_name,
+        workspace_requires_true_legacy_launch,
     };
     use std::{fs, path::PathBuf};
 
@@ -2741,6 +2799,136 @@ end tell"#;
         assert_eq!(
             plan_workspace_launch(script, &rows),
             WorkspaceLaunchMode::DirectLegacy
+        );
+    }
+
+    /// Builds the normalized `tab\tpane\tid\twd\ttitle\tx,y,w,h` capture rows that
+    /// `generate_workspace_script` consumes.
+    fn captured_panes(panes: &[(&str, &str)]) -> String {
+        panes
+            .iter()
+            .enumerate()
+            .map(|(index, (working_dir, rect))| {
+                format!("1\t{}\tid{index}\t{working_dir}\t\t{rect}", index + 1)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Ghostty always splits 50/50, so three panes captured at equal widths would come
+    /// back as 50/25/25 without an explicit `equalize_splits`.
+    #[test]
+    fn equal_columns_capture_emits_equalize_splits() {
+        let script = generate_workspace_script(&captured_panes(&[
+            ("/a", "0,0,498,900"),
+            ("/b", "500,0,498,900"),
+            ("/c", "1000,0,498,900"),
+        ]))
+        .unwrap();
+
+        assert!(
+            script.contains("perform action \"equalize_splits\" on p1"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn equal_rows_capture_emits_equalize_splits() {
+        let script = generate_workspace_script(&captured_panes(&[
+            ("/a", "0,0,1500,298"),
+            ("/b", "0,300,1500,298"),
+            ("/c", "0,600,1500,298"),
+        ]))
+        .unwrap();
+
+        assert!(
+            script.contains("perform action \"equalize_splits\" on p1"),
+            "{script}"
+        );
+    }
+
+    /// A deliberately uneven layout must not be flattened into equal panes.
+    #[test]
+    fn uneven_columns_capture_omits_equalize_splits() {
+        let script = generate_workspace_script(&captured_panes(&[
+            ("/a", "0,0,900,900"),
+            ("/b", "902,0,298,900"),
+            ("/c", "1202,0,298,900"),
+        ]))
+        .unwrap();
+
+        assert!(!script.contains("equalize_splits"), "{script}");
+    }
+
+    /// A 2x2 grid is already what plain 50/50 splits produce, so no correction is needed.
+    #[test]
+    fn balanced_grid_capture_omits_redundant_equalize_splits() {
+        let script = generate_workspace_script(&captured_panes(&[
+            ("/a", "0,0,748,448"),
+            ("/b", "750,0,748,448"),
+            ("/c", "0,450,748,448"),
+            ("/d", "750,450,748,448"),
+        ]))
+        .unwrap();
+
+        assert!(!script.contains("equalize_splits"), "{script}");
+    }
+
+    #[test]
+    fn single_pane_capture_omits_equalize_splits() {
+        let script = generate_workspace_script(&captured_panes(&[("/a", "0,0,1,1")])).unwrap();
+
+        assert!(!script.contains("equalize_splits"), "{script}");
+    }
+
+    /// The extra line must stay invisible to the parsers that drive launch and preview.
+    #[test]
+    fn equalize_splits_line_does_not_disturb_workspace_parsing() {
+        let script = generate_workspace_script(&captured_panes(&[
+            ("/a", "0,0,498,900"),
+            ("/b", "500,0,498,900"),
+            ("/c", "1000,0,498,900"),
+        ]))
+        .unwrap();
+        assert!(script.contains("equalize_splits"), "{script}");
+
+        let rows = parse_workspace_rows(&script);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.working_dir.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/a", "/b", "/c"]
+        );
+        assert_eq!(
+            plan_workspace_launch(&script, &rows),
+            WorkspaceLaunchMode::DirectSplit
+        );
+
+        let layout = parse_workspace_layout(&script);
+        assert_eq!(layout.len(), 1);
+        let WorkspacePaneLayout::SplitRight { left, right } = &layout[0].root else {
+            panic!("expected a right split, got {:?}", layout[0].root);
+        };
+        assert_eq!(
+            **left,
+            WorkspacePaneLayout::Leaf {
+                working_dir: "/a".to_string()
+            }
+        );
+        let WorkspacePaneLayout::SplitRight { left, right } = &**right else {
+            panic!("expected a nested right split, got {right:?}");
+        };
+        assert_eq!(
+            **left,
+            WorkspacePaneLayout::Leaf {
+                working_dir: "/b".to_string()
+            }
+        );
+        assert_eq!(
+            **right,
+            WorkspacePaneLayout::Leaf {
+                working_dir: "/c".to_string()
+            }
         );
     }
 

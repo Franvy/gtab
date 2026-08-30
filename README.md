@@ -290,6 +290,12 @@ Nix/Home Manager usually generates Ghostty config from a declaration source inst
 
 Yes, as of v1.4.1. `gtab save` captures split pane layouts. Splits are restored when launching.
 
+### My panes were evenly sized, but they come back uneven
+
+Fixed as of v1.8.1. Ghostty creates every split at 50/50, so three evenly sized panes used to reopen as 50/25/25. `gtab save` now compares the captured pane geometry against Ghostty's `equalize_splits` result and, when they match, records that action in the workspace script so even layouts reopen even.
+
+Uneven layouts you arranged on purpose are still restored at Ghostty's default 50/50 per split. Ghostty's AppleScript API can only create splits, not set their exact ratios, so arbitrary proportions are not preserved yet.
+
 ---
 
 ## License

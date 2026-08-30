@@ -31,10 +31,11 @@ The following scenarios still require manual verification on macOS with Ghostty:
 1. Save a workspace with manually renamed tabs and confirm the generated `.applescript` contains the expected `set_tab_title:...` values.
 2. Reopen that workspace and confirm tab titles restore correctly.
 3. Save and reopen a split-pane workspace.
-4. Launch from the TUI and confirm window frame sync works when Accessibility permissions are granted.
-5. Run `gtab init` and `gtab set ghostty_shortcut ...` against a normal writable Ghostty config.
-6. Repeat shortcut setup against a Nix/Home Manager or otherwise externally managed Ghostty config and confirm the manual-setup messaging is correct.
-7. Shell-mode shortcut: install `eval "$(gtab shell-init zsh)"`, run `gtab init`, reload Ghostty, then in a Ghostty shell run `cat -v` and press `Cmd+G` — Ghostty must emit `^[[71;9u`. Press `Ctrl+C`, type half a command, press `Cmd+G`, and confirm the TUI opens, the prompt comes back with the half-typed command intact, and neither `gtab` nor the escape sequence is left on screen or in shell history.
+4. Split a tab into three or more evenly sized panes, save it, and reopen it — every pane must come back at the same size (the generated script should contain `perform action "equalize_splits"`). Repeat with a deliberately uneven layout and confirm no `equalize_splits` line is written.
+5. Launch from the TUI and confirm window frame sync works when Accessibility permissions are granted.
+6. Run `gtab init` and `gtab set ghostty_shortcut ...` against a normal writable Ghostty config.
+7. Repeat shortcut setup against a Nix/Home Manager or otherwise externally managed Ghostty config and confirm the manual-setup messaging is correct.
+8. Shell-mode shortcut: install `eval "$(gtab shell-init zsh)"`, run `gtab init`, reload Ghostty, then in a Ghostty shell run `cat -v` and press `Cmd+G` — Ghostty must emit `^[[71;9u`. Press `Ctrl+C`, type half a command, press `Cmd+G`, and confirm the TUI opens, the prompt comes back with the half-typed command intact, and neither `gtab` nor the escape sequence is left on screen or in shell history.
 
 ## Notes
 
