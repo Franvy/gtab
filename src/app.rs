@@ -827,16 +827,11 @@ impl App {
             .map(|label| label.chars().count() as u16)
             .collect();
 
-        let mut columns = grid_column_count(labels.len(), rows_per_page);
-        // Shrink until the widest row fits; a narrow pane simply scrolls.
-        while columns > 1
-            && grid_column_widths(&labels, columns)
-                .iter()
-                .map(|width| u32::from(*width))
-                .sum::<u32>()
-                + u32::from(GRID_CELL_GAP) * (columns as u32 - 1)
-                > u32::from(available_width)
-        {
+        // Start as wide as the grid may get, then shrink until the widest row
+        // fits, so the names spread across the pane instead of bunching up on
+        // the left. A pane too narrow for two columns simply scrolls.
+        let mut columns = GRID_MAX_COLUMNS.min(labels.len()).max(1);
+        while columns > 1 && grid_row_width(&labels, columns) > u32::from(available_width) {
             columns -= 1;
         }
 
@@ -1980,16 +1975,11 @@ fn fit_grid_cell(label: &str, cell_width: u16) -> String {
 
 /// Column count for a compact, balanced block: roughly square, widened only
 /// when the entries would not otherwise fit on one page.
-fn grid_column_count(len: usize, rows_per_page: usize) -> usize {
-    if len == 0 {
-        return 1;
-    }
-
-    let balanced = (1..).find(|side| side * side >= len).unwrap_or(1);
-    let to_fit_page = len.div_ceil(rows_per_page.max(1));
-    balanced
-        .max(to_fit_page)
-        .clamp(1, GRID_MAX_COLUMNS.min(len))
+/// Width of one grid row: every column plus the gaps between them.
+fn grid_row_width(labels: &[u16], columns: usize) -> u32 {
+    let widths = grid_column_widths(labels, columns);
+    let gaps = u32::from(GRID_CELL_GAP) * (widths.len() as u32 - 1);
+    widths.iter().map(|width| u32::from(*width)).sum::<u32>() + gaps
 }
 
 /// Width of each column, sized to its own widest entry so short names do not
@@ -3302,7 +3292,7 @@ mod tests {
         ];
         app.mode = BrowserMode::Directory;
         app.grid_list = true;
-        app.list_area = Rect::new(0, 0, 40, 4);
+        app.list_area = Rect::new(0, 0, 20, 4);
 
         let text = grid_text(&app, &app.visible_labels(), &theme);
         let lines = text_lines(text);
@@ -3323,7 +3313,7 @@ mod tests {
         ];
         app.mode = BrowserMode::Directory;
         app.grid_list = true;
-        app.list_area = Rect::new(0, 0, 40, 4);
+        app.list_area = Rect::new(0, 0, 20, 4);
 
         // Two columns: "[docs]"/"[notes]" (7 wide) then a 2 column gap.
         assert_eq!(app.list_index_at(0, 0), Some(0));
@@ -3342,7 +3332,7 @@ mod tests {
         ];
         app.mode = BrowserMode::Directory;
         app.grid_list = true;
-        app.list_area = Rect::new(0, 0, 40, 4);
+        app.list_area = Rect::new(0, 0, 20, 4);
 
         assert_eq!(
             app.handle_main_key(KeyEvent::from(KeyCode::Down), &env())
@@ -3998,13 +3988,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn directory_grid_stays_compact_instead_of_spanning_the_pane() {
-        // Regression: the grid used one global cell width and as many columns
-        // as the pane could hold, so a short list spread edge to edge with a
-        // ragged final row and wide gaps after short names.
-        let mut app = app(vec![workspace("alpha")]);
-        app.directories = [
+    fn mixed_length_directories() -> Vec<SavedDirectory> {
+        [
             "blog",
             "design-limns",
             "gtab",
@@ -4020,29 +4005,67 @@ mod tests {
         ]
         .into_iter()
         .map(|name| directory(name, "/tmp"))
-        .collect();
+        .collect()
+    }
+
+    #[test]
+    fn directory_grid_fills_the_available_width() {
+        // Regression: the column count was ceil(sqrt(len)) and ignored the pane
+        // width, so 12 names sat in a 4 column block with the right half of a
+        // wide pane left empty.
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = mixed_length_directories();
         app.mode = BrowserMode::Directory;
         app.grid_list = true;
-        app.list_area = Rect::new(0, 0, 142, 13);
+        app.list_area = Rect::new(0, 0, 73, 40);
 
+        // A 7th column would need 74 columns of width, so 6 is the widest fit.
         let metrics = app.grid_metrics();
-        assert_eq!(metrics.columns, 4);
+        assert_eq!(metrics.columns, 6);
 
         let theme = Theme::detect();
         let lines = text_lines(grid_text(&app, &app.visible_labels(), &theme));
-        assert_eq!(lines.len(), 3, "expected a balanced 4x3 block: {lines:?}");
+        assert_eq!(lines.len(), 2, "expected a 6x2 block: {lines:?}");
+        assert_eq!(lines[0].trim_end().chars().count(), 66, "{:?}", lines[0]);
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 73,
+                "row overflows the pane: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_grid_sizes_each_column_independently() {
+        // Regression: the grid used one global cell width, so every short name
+        // inherited the padding of the longest entry in the whole grid.
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = mixed_length_directories();
+        app.mode = BrowserMode::Directory;
+        app.grid_list = true;
+        app.list_area = Rect::new(0, 0, 73, 40);
+
+        let theme = Theme::detect();
+        let lines = text_lines(grid_text(&app, &app.visible_labels(), &theme));
+        // Only the 2 column gap separates them; "[blog]" is not padded out to
+        // the width of "[design-limns]".
         assert!(
-            lines[0].trim_end().chars().count() < 50,
-            "grid should stay compact, got {:?}",
+            lines[0].starts_with("[blog]  [design-limns]"),
+            "unexpected column widths: {:?}",
             lines[0]
         );
-        // Columns are sized per column, so a short name is not padded out to
-        // the width of the longest entry in the whole grid.
-        assert!(
-            lines[1].starts_with("[limns]  [limns-admin]"),
-            "unexpected column widths: {:?}",
-            lines[1]
-        );
+    }
+
+    /// The cap keeps an ultra-wide pane from shredding the list into slivers.
+    #[test]
+    fn directory_grid_stops_at_the_column_cap() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = mixed_length_directories();
+        app.mode = BrowserMode::Directory;
+        app.grid_list = true;
+        app.list_area = Rect::new(0, 0, 400, 40);
+
+        assert_eq!(app.grid_metrics().columns, GRID_MAX_COLUMNS);
     }
 
     #[test]
@@ -4054,7 +4077,7 @@ mod tests {
             .collect();
         app.mode = BrowserMode::Directory;
         app.grid_list = true;
-        app.list_area = Rect::new(0, 0, 60, 10);
+        app.list_area = Rect::new(0, 0, 40, 10);
 
         let theme = Theme::detect();
         let lines = text_lines(grid_text(&app, &app.visible_labels(), &theme));
@@ -4064,8 +4087,14 @@ mod tests {
             .collect();
 
         assert!(offsets.len() > 1);
+        // The last row is allowed to be short, but every cell it does draw must
+        // start under the matching cell of the first row.
         for row in &offsets[1..] {
-            assert_eq!(*row, offsets[0], "columns drifted between rows: {lines:?}");
+            assert_eq!(
+                *row,
+                offsets[0][..row.len()],
+                "columns drifted between rows: {lines:?}"
+            );
         }
     }
 
