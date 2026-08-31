@@ -92,7 +92,7 @@ When you launch from the TUI, the new Ghostty window is repositioned to match yo
 Directory Space stores named directory paths only. It does not rebuild Ghostty tabs or windows.
 
 - Press `f` in the TUI to switch to Directory Space.
-- Saved directories are shown in a grid that fills the pane width (up to 8 columns); each column is sized to its own widest entry, so short names are not padded out to the longest one.
+- Saved directories are shown in a grid that fills the pane width; each column is sized to its own widest entry, so short names are not padded out to the longest one.
 - Press `a` to save the current shell directory as a named entry.
 - Press `Enter` (or double-click) to replace the current split with a fresh shell started in that directory.
 

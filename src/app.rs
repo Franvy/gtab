@@ -57,7 +57,6 @@ const WORKSPACE_COLUMNS_MIN_WIDTH: u16 = MAIN_LIST_WIDTH
 const GRID_CELL_MIN_WIDTH: u16 = 6;
 const GRID_CELL_MAX_WIDTH: u16 = 26;
 const GRID_CELL_GAP: u16 = 2;
-const GRID_MAX_COLUMNS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TuiExit {
@@ -830,7 +829,7 @@ impl App {
         // Start as wide as the grid may get, then shrink until the widest row
         // fits, so the names spread across the pane instead of bunching up on
         // the left. A pane too narrow for two columns simply scrolls.
-        let mut columns = GRID_MAX_COLUMNS.min(labels.len()).max(1);
+        let mut columns = grid_column_cap(available_width).min(labels.len()).max(1);
         while columns > 1 && grid_row_width(&labels, columns) > u32::from(available_width) {
             columns -= 1;
         }
@@ -1973,8 +1972,14 @@ fn fit_grid_cell(label: &str, cell_width: u16) -> String {
     format!("{truncated:<width$}")
 }
 
-/// Column count for a compact, balanced block: roughly square, widened only
-/// when the entries would not otherwise fit on one page.
+/// Widest grid the pane could hold: every column costs at least a minimum
+/// cell plus the gap in front of it, so the shrink loop starts from the pane
+/// width instead of a fixed cap that leaves wide panes half empty.
+fn grid_column_cap(available_width: u16) -> usize {
+    let stride = GRID_CELL_MIN_WIDTH.saturating_add(GRID_CELL_GAP);
+    usize::from(available_width.saturating_add(GRID_CELL_GAP) / stride).max(1)
+}
+
 /// Width of one grid row: every column plus the gaps between them.
 fn grid_row_width(labels: &[u16], columns: usize) -> u32 {
     let widths = grid_column_widths(labels, columns);
@@ -4056,16 +4061,46 @@ mod tests {
         );
     }
 
-    /// The cap keeps an ultra-wide pane from shredding the list into slivers.
     #[test]
-    fn directory_grid_stops_at_the_column_cap() {
+    fn directory_grid_keeps_filling_past_eight_columns() {
+        // Regression: the column count was capped at 8, so a pane wider than
+        // ~90 columns stopped adding names and left the right side blank.
         let mut app = app(vec![workspace("alpha")]);
         app.directories = mixed_length_directories();
         app.mode = BrowserMode::Directory;
         app.grid_list = true;
+        app.list_area = Rect::new(0, 0, 160, 40);
+
+        let metrics = app.grid_metrics();
+        assert_eq!(metrics.columns, app.visible_labels().len());
+
+        let theme = Theme::detect();
+        let lines = text_lines(grid_text(&app, &app.visible_labels(), &theme));
+        assert_eq!(lines.len(), 1, "expected a single row: {lines:?}");
+    }
+
+    /// Cells stay content sized, so an ultra-wide pane only stops adding
+    /// columns once the names run out.
+    #[test]
+    fn directory_grid_never_overflows_an_ultra_wide_pane() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = (0..80)
+            .map(|index| directory(&format!("dir{index}"), "/tmp"))
+            .collect();
+        app.mode = BrowserMode::Directory;
+        app.grid_list = true;
         app.list_area = Rect::new(0, 0, 400, 40);
 
-        assert_eq!(app.grid_metrics().columns, GRID_MAX_COLUMNS);
+        let metrics = app.grid_metrics();
+        assert!(metrics.columns > 8, "got {} columns", metrics.columns);
+
+        let theme = Theme::detect();
+        for line in text_lines(grid_text(&app, &app.visible_labels(), &theme)) {
+            assert!(
+                line.chars().count() <= 400,
+                "row overflows the pane: {line:?}"
+            );
+        }
     }
 
     #[test]
