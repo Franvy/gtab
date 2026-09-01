@@ -22,12 +22,18 @@ brew install gtab
 gtab init
 ```
 
-Reload the Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghostty shell to open the launcher.
+`gtab init` writes a managed Ghostty keybind file and includes it from your Ghostty config. Reload the config with **Cmd+Shift+,** (or restart Ghostty), then press **Cmd+G** inside any Ghostty shell to open the launcher.
+
+The first time you save or launch a workspace, macOS shows a permission prompt: `gtab` drives Ghostty through System Events to read split-pane geometry and to position the new window. Allow it once. If you dismissed the prompt, re-enable it under System Settings → Privacy & Security → Accessibility.
 
 <details>
 <summary>Build from source</summary>
 
+Requires the Rust toolchain.
+
 ```bash
+git clone https://github.com/Franvy/gtab.git
+cd gtab
 cargo install --path .
 gtab init
 ```
@@ -38,11 +44,23 @@ Update with `brew upgrade gtab`.
 
 ### Optional: silent shortcut
 
-By default `Cmd+G` types `gtab` into your shell, so the command stays on screen and lands in shell history. Add the shell integration to make it invisible:
+By default `Cmd+G` types `gtab` into your shell, so the command stays on screen and lands in shell history. Add the shell integration for your shell to make it invisible:
 
 ```bash
-echo 'eval "$(gtab shell-init zsh)"' >> ~/.zshrc   # bash: shell-init bash >> ~/.bashrc
-exec zsh
+# zsh
+echo 'eval "$(gtab shell-init zsh)"' >> ~/.zshrc
+
+# bash
+echo 'eval "$(gtab shell-init bash)"' >> ~/.bashrc
+
+# fish
+echo 'gtab shell-init fish | source' >> ~/.config/fish/config.fish
+```
+
+Then start a new shell and re-run `gtab init`:
+
+```bash
+exec $SHELL
 gtab init
 ```
 
