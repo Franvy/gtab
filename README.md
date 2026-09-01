@@ -1,14 +1,20 @@
-# gtab
+# Gtab
+
+[![Release](https://img.shields.io/github/v/release/Franvy/gtab)](https://github.com/Franvy/gtab/releases)
+[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)](https://ghostty.org)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `gtab` is a lightweight workspace manager for [Ghostty](https://ghostty.org) on macOS.
 
 Save your current Ghostty window layout as a named workspace. Reopen it later with a single keystroke. That is the whole idea.
 
-<video src="https://github.com/user-attachments/assets/beb81b3f-b28f-4b4e-a9d9-21c546a87e0a" autoplay loop muted playsinline></video>
+<video src="https://github.com/user-attachments/assets/104aebe0-c1ba-41f7-9625-ada7d40f6733" autoplay loop muted playsinline></video>
+
+**Requirements:** macOS · [Ghostty](https://ghostty.org) · zsh, bash, or fish (for the silent shortcut)
 
 ---
 
-## Quick Install
+## Install
 
 ```bash
 brew tap Franvy/gtab
@@ -16,7 +22,23 @@ brew install gtab
 gtab init
 ```
 
-For a shortcut that leaves no text behind, add the shell integration and re-run `gtab init`:
+Reload the Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghostty shell to open the launcher.
+
+<details>
+<summary>Build from source</summary>
+
+```bash
+cargo install --path .
+gtab init
+```
+
+</details>
+
+Update with `brew upgrade gtab`.
+
+### Optional: silent shortcut
+
+By default `Cmd+G` types `gtab` into your shell, so the command stays on screen and lands in shell history. Add the shell integration to make it invisible:
 
 ```bash
 echo 'eval "$(gtab shell-init zsh)"' >> ~/.zshrc   # bash: shell-init bash >> ~/.bashrc
@@ -24,22 +46,39 @@ exec zsh
 gtab init
 ```
 
-Reload Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghostty shell to open the workspace launcher.
+`gtab init` detects the integration and switches `shortcut_mode` to `shell` on its own. See [Shortcut model](#shortcut-model) for the details.
 
 ---
 
-## What It Does
+## Quick start
 
-- Save a Ghostty window as a named workspace — tabs, working directories, titles, and split panes
-- Reopen any workspace later as a fresh Ghostty window with native tabs
-- Save named directory entries and reopen the current split as a fresh shell in that directory
-- Launch from a small keyboard-first TUI, or directly from the shell
-- New window automatically aligns to your current Ghostty window position and size
-- Rename, delete, and search workspaces without leaving the TUI
-- The TUI adapts to the terminal width: quick settings hides first, then the layout preview moves below the workspace list and the names wrap into columns
-- Fast in-app shortcut via `Cmd+G` set up with `gtab init` — with the shell integration installed it launches silently, leaving no command text and no shell history entry
+1. Open Ghostty and arrange your tabs and splits the way you want them.
+2. Save the layout:
 
-## What It Does Not Do
+   ```bash
+   gtab save myproject
+   ```
+
+3. Press `Cmd+G` (or run `gtab`) to open the TUI, type to search, press `Enter` to launch.
+4. Or skip the TUI entirely:
+
+   ```bash
+   gtab myproject
+   ```
+
+---
+
+## What it does
+
+- Saves a Ghostty window as a named workspace — tabs, working directories, titles, and split panes
+- Reopens any workspace as a fresh Ghostty window with native tabs
+- Saves named directory entries, and reopens the current split as a fresh shell in that directory
+- Launches from a keyboard-first TUI, or straight from the shell
+- Aligns the new window to your current Ghostty window's position and size
+- Renames, deletes, and searches without leaving the TUI
+- Adapts its layout to the terminal width, down to a 36x15 terminal
+
+## What it does not do
 
 - Does not persist running processes
 - Does not restore shell history, editor buffers, SSH sessions, or pane state
@@ -47,60 +86,82 @@ Reload Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghos
 
 ---
 
-## Typical Workflow
+## The TUI
 
-1. Open Ghostty, arrange your tabs the way you want.
-2. Save the layout:
+The TUI has two spaces, toggled with `f`:
 
-```bash
-gtab save myproject
-```
+- **Workspace space** — saved Ghostty window layouts. The list sits on the left, with a tab/split preview and quick settings beside it.
+- **Directory space** — saved directory paths, shown as an adaptive multi-column grid.
 
-3. Press `Cmd+G` inside Ghostty (or run `gtab`) to open the TUI.
-4. Type to search, press `Enter` to launch.
-5. Or launch directly by name:
+Both spaces share the same keys wherever the action makes sense.
 
-```bash
-gtab myproject
-```
+### Keys
 
----
-
-## TUI Keys
+**Move**
 
 | Key | Action |
 |-----|--------|
-| `f` | Toggle Workspace Space / Directory Space |
-| `/` | Search current space |
-| `↑` / `↓` | Move selection |
-| `Enter` | Workspace: launch selected workspace; Directory: replace the current split with a fresh shell in that directory |
-| `a` | Workspace: save current Ghostty window; Directory: save current shell directory |
-| `n` | Rename selected item in current space |
-| `d` | Delete selected item in current space |
-| `e` | Workspace only: open workspace file in `$EDITOR` |
-| `g` | Workspace only: edit Ghostty shortcut |
-| `q` / `Esc` | Quit |
+| `↑` `↓` / `j` `k` / `w` `s` | Move selection |
+| `←` `→` | Move within a grid layout |
+| `Home` / `End` `G` | Jump to first / last entry |
+| `PgUp` / `PgDn` | Page up / down |
 
-> **Double-click** also runs the primary action of the current space (launch/replace).
+**Search**
 
-When you launch from the TUI, the new Ghostty window is repositioned to match your current window's position and size. This uses macOS Accessibility (System Events), so you may need to grant permission once.
+| Key | Action |
+|-----|--------|
+| `/` | Start filtering the current space |
+| `Tab` `Shift-Tab` / `Ctrl-n` `Ctrl-p` / `Ctrl-j` `Ctrl-k` | Move selection while filtering |
+| `Enter` | Keep the filter |
+| `Esc` | Revert the filter |
+
+**Act**
+
+| Key | Workspace space | Directory space |
+|-----|-----------------|-----------------|
+| `Enter` | Launch selected workspace | Replace the current split with a fresh shell in that directory |
+| `a` | Save the current Ghostty window | Save the current shell directory |
+| `n` | Rename selected | Rename selected |
+| `d` | Delete selected | Delete selected |
+| `e` | Open workspace file in `$EDITOR` | — |
+| `g` | Edit the Ghostty shortcut | — |
+| `t` | Open quick settings | — |
+
+**Other**
+
+| Key | Action |
+|-----|--------|
+| `r` | Reload from disk |
+| `?` | Help |
+| `q` | Quit |
+| `Esc` | Clear an active filter, otherwise quit |
+
+**Mouse:** click to select, double-click to run the primary action of the space (launch/replace), scroll wheel to move. In Workspace space, clicking the shortcut field opens the shortcut editor.
+
+### Responsive layout
+
+The workspace screen picks its layout from the available width, in this order:
+
+1. **Wide** — list, layout preview, and quick settings side by side.
+2. **Medium** — quick settings drops out; list plus preview.
+3. **Narrow** — the preview moves below the list and workspace names wrap into columns.
+
+Directory entries always render as a grid that fills the pane width; each column is sized to its own widest entry, so short names are not padded out to the longest one. Below 36x15 the TUI shows a "terminal too small" screen instead.
+
+When you launch from the TUI, the new Ghostty window is repositioned to match your current window. This uses macOS Accessibility (System Events), so you may need to grant permission once.
 
 ---
 
-## Directory Space
+## Directory space
 
-Directory Space stores named directory paths only. It does not rebuild Ghostty tabs or windows.
+Directory space stores named directory paths only. It does not rebuild Ghostty tabs or windows.
 
-- Press `f` in the TUI to switch to Directory Space.
-- Saved directories are shown in a grid that fills the pane width; each column is sized to its own widest entry, so short names are not padded out to the longest one.
-- Press `a` to save the current shell directory as a named entry.
-- Press `Enter` (or double-click) to replace the current split with a fresh shell started in that directory.
+Press `f` to switch to it, `a` to save the current shell directory, and `Enter` (or double-click) to swap the current split for a fresh shell started in that directory.
 
-By default, gtab swaps the current split process for a new shell started in the selected directory. This keeps Directory Space zero-setup: upgrade gtab and use it immediately.
+This keeps Directory space zero-setup — upgrade gtab and use it immediately. Because it replaces the shell process in that split, in-flight shell state in the old split is discarded.
 
-This replaces the shell process in that split, so in-flight shell state inside the old split is discarded.
-
-If you prefer a shell-wrapper fallback (for example, running outside Ghostty), you can still use:
+<details>
+<summary>Shell-wrapper fallback (for use outside Ghostty)</summary>
 
 ```bash
 gtab() {
@@ -117,89 +178,53 @@ gtab() {
 }
 ```
 
-`gtab --shell-cd` is only for this wrapper flow. Other commands and workspace launches are unchanged.
+`gtab --shell-cd` exists only for this wrapper flow. Other commands and workspace launches are unchanged.
+
+</details>
 
 ---
 
-## Core Commands
+## Commands
 
 ```text
 gtab                     Open the TUI
-gtab init                Enable the Ghostty-local Cmd+G shortcut
-gtab shell-init <shell>  Print the shell integration for zsh, bash, or fish
-gtab save <name>         Save the current Ghostty window
 gtab <name>              Launch a workspace directly
+gtab save <name>         Save the current Ghostty window
 gtab list                List saved workspaces
 gtab rename <old> <new>  Rename a workspace
 gtab remove <name>       Remove a workspace
+gtab edit <name>         Open a workspace file in $EDITOR
+gtab init                Enable the Ghostty-local Cmd+G shortcut
+gtab shell-init <shell>  Print the shell integration for zsh, bash, or fish
+gtab set                 Show current settings
+gtab --version           Print the version
 ```
 
-## Advanced Commands
+### Settings
 
 ```text
-gtab edit <name>                       Open workspace file in $EDITOR
-gtab set                               Show current settings
-gtab set close_tab on|off              Auto-close the launching tab after launch
-gtab set ghostty_shortcut cmd+g|off    Change or disable the Ghostty shortcut
-gtab set shortcut_mode shell|text      Silent widget trigger, or type `gtab` into the shell
+gtab set close_tab on|off               Auto-close the launching tab after launch
+gtab set ghostty_shortcut <key>|off     Change or disable the Ghostty shortcut (e.g. cmd+shift+g)
+gtab set shortcut_mode shell|text       Silent widget trigger, or type `gtab` into the shell
 ```
 
-Workspaces are stored as plain `.applescript` files in `~/.config/gtab/`.
-Directory entries are stored as plain `.path` files in `~/.config/gtab/dirs/`.
+### Storage
+
+Everything lives in `~/.config/gtab/`, or `$GTAB_DIR` when set:
+
+```text
+~/.config/gtab/
+├── <name>.applescript      A saved workspace
+├── dirs/<name>.path        A saved directory entry
+├── config                  Settings
+└── ghostty-shortcut.conf   Managed Ghostty keybind file
+```
+
+All plain text, all safe to read, edit, back up, or sync.
 
 ---
 
-## Install
-
-### Homebrew (recommended)
-
-```bash
-brew tap Franvy/gtab
-brew install gtab
-gtab init
-```
-
-Reload Ghostty config or restart Ghostty. Then press `Cmd+G` inside any Ghostty shell.
-
-### Build from source
-
-Requirements: macOS, [Ghostty](https://ghostty.org), Rust toolchain.
-
-```bash
-cargo install --path .
-gtab init
-```
-
-### Update
-
-```bash
-brew upgrade gtab
-```
-
----
-
-## Uninstall
-
-```bash
-# Disable the Ghostty shortcut first
-gtab set ghostty_shortcut off
-
-# Reload Ghostty config so Cmd+G stops working
-
-# Remove the shell integration line from your shell rc if you added one
-#   eval "$(gtab shell-init zsh)"
-
-# Then remove the binary
-brew uninstall gtab
-# or: cargo uninstall gtab
-
-# Optionally remove saved workspaces and config
-rm -rf ~/.config/gtab
-```
-
----
-
-## Shortcut Model
+## Shortcut model
 
 `gtab init` writes a managed Ghostty keybind file and adds an `include` line to your Ghostty config. Ghostty has no keybind action that runs an external command, so the keybind sends text to the focused shell. There are two ways to do that, selected by `shortcut_mode`.
 
@@ -217,7 +242,7 @@ eval "$(gtab shell-init bash)"     # ~/.bashrc
 gtab shell-init fish | source      # ~/.config/fish/config.fish
 ```
 
-Nothing is echoed into the prompt, nothing enters shell history, and a half-typed command line is restored exactly as it was when the TUI exits.
+Nothing is echoed into the prompt, nothing enters shell history, and a half-typed command line is restored exactly as it was when the TUI exits. This is the same technique fzf and atuin use for their key bindings.
 
 `gtab init` switches to this mode automatically once it finds a `gtab shell-init` line in your shell rc files. You can also set it explicitly with `gtab set shortcut_mode shell`. If shell mode is active but the integration is missing, `gtab init` and `gtab set` both warn that the shortcut will do nothing.
 
@@ -231,15 +256,27 @@ keybind = cmd+g=text:gtab\x0d
 
 Ghostty types `gtab` into the active shell. No shell configuration needed, but the command stays visible on screen and lands in shell history.
 
-**Tradeoff (both modes):** the shortcut only reaches the shell, so it is not safe inside full-screen interactive programs like Claude Code, vim, or fzf — `text` mode types `gtab` into them and `shell` mode sends a stray escape sequence. Quit those programs first, or use `gtab <name>` from a clean shell prompt.
+> **Tradeoff (both modes):** the shortcut only reaches the shell, so it is not safe inside full-screen interactive programs like Claude Code, vim, or fzf — `text` mode types `gtab` into them, and `shell` mode sends a stray escape sequence. Quit those programs first, or run `gtab <name>` from a clean shell prompt.
 
-If your Ghostty config is managed by Nix/Home Manager or another read-only setup, `gtab init` will still write `~/.config/gtab/ghostty-shortcut.conf`, then tell you to add this line to your Ghostty config source manually:
+### Nix / Home Manager
+
+If your Ghostty config is read-only, `gtab init` still writes `~/.config/gtab/ghostty-shortcut.conf` and then tells you to add this line to your config source manually:
 
 ```conf
 config-file = "/Users/you/.config/gtab/ghostty-shortcut.conf"
 ```
 
-After that, rebuild/apply your config and reload or restart Ghostty.
+Rebuild/apply your config, then reload or restart Ghostty.
+
+---
+
+## How it works
+
+`gtab save` reads the current Ghostty window through Ghostty's AppleScript API. For split-pane tabs, it also queries macOS Accessibility to capture pane positions, then reconstructs the split tree. The result is a plain `.applescript` file in `~/.config/gtab/`.
+
+Launching a workspace runs that script through `osascript` to open a fresh Ghostty window and recreate the saved layout.
+
+That is why `gtab` stays lightweight: it stores layout metadata, not live terminal session state.
 
 ---
 
@@ -256,45 +293,68 @@ After that, rebuild/apply your config and reload or restart Ghostty.
 
 ---
 
-## How It Works
-
-`gtab save` reads the current Ghostty window through Ghostty's AppleScript API. For split-pane tabs, it also queries macOS Accessibility to capture pane positions, then reconstructs the split tree. The result is a plain `.applescript` file stored in `~/.config/gtab/`.
-
-Launching a workspace runs that script via `osascript` to open a fresh Ghostty window and recreate the saved layout.
-
-That is why `gtab` is lightweight: it stores layout metadata, not live terminal session state.
-
----
-
 ## FAQ
 
-### Why does `Cmd+G` send text instead of running the binary directly?
+<details>
+<summary>Why does Cmd+G send text instead of running the binary directly?</summary>
 
-Ghostty keybindings do not have an action for running external commands. The `text` action sends a string to the active shell, so that string is the only channel available.
+Ghostty keybindings have no action for running external commands. The `text` action sends a string to the active shell, so that string is the only channel available.
 
-`shortcut_mode = shell` uses that channel for an invisible trigger sequence rather than the literal word `gtab`, and lets a shell widget do the launching — the same technique fzf and atuin use for their key bindings.
+`shortcut_mode = shell` uses that channel for an invisible trigger sequence rather than the literal word `gtab`, and lets a shell widget do the launching.
 
-See: [ghostty.org/docs/config/keybind](https://ghostty.org/docs/config/keybind)
+See [ghostty.org/docs/config/keybind](https://ghostty.org/docs/config/keybind).
 
-### The shortcut does nothing after switching to `shortcut_mode = shell`
+</details>
+
+<details>
+<summary>The shortcut does nothing after switching to shortcut_mode = shell</summary>
 
 The widget is missing. Run `gtab set` — in shell mode it checks your shell rc files and warns if no `gtab shell-init` line is there. Add the line back and start a new shell, or fall back with `gtab set shortcut_mode text`.
 
-The check scans every common rc file without knowing which shell you are in, so if you use both zsh and bash and only installed the integration for one of them, the shortcut works only in that shell.
+The check scans every common rc file without knowing which shell you are in, so if you use both zsh and bash but installed the integration for only one, the shortcut works only in that shell.
 
-### Why doesn't gtab edit my Nix/Home Manager config directly?
+</details>
 
-Nix/Home Manager usually generates Ghostty config from a declaration source instead of a normal writable file. `gtab` can safely generate its own managed include file, but it cannot reliably edit every user's `home.nix`, flake module, or repo layout without risking a bad config change. In those setups, `gtab init` writes the managed include file and tells you exactly which `config-file = ...` line to add to your config source.
+<details>
+<summary>Why doesn't gtab edit my Nix / Home Manager config directly?</summary>
 
-### Does gtab support split panes?
+Nix and Home Manager generate the Ghostty config from a declaration source instead of a normal writable file. `gtab` can safely generate its own managed include file, but it cannot reliably edit every user's `home.nix`, flake module, or repo layout without risking a bad config change. In those setups, `gtab init` writes the managed include file and tells you exactly which `config-file = ...` line to add.
 
-Yes, as of v1.4.1. `gtab save` captures split pane layouts. Splits are restored when launching.
+</details>
 
-### My panes were evenly sized, but they come back uneven
+<details>
+<summary>Does gtab support split panes?</summary>
 
-Fixed as of v1.8.1. Ghostty creates every split at 50/50, so three evenly sized panes used to reopen as 50/25/25. `gtab save` now compares the captured pane geometry against Ghostty's `equalize_splits` result and, when they match, records that action in the workspace script so even layouts reopen even.
+Yes, since v1.4.1. `gtab save` captures split-pane layouts, and they are restored on launch.
+
+</details>
+
+<details>
+<summary>My panes were evenly sized, but they come back uneven</summary>
+
+Fixed in v1.8.1. Ghostty creates every split at 50/50, so three evenly sized panes used to reopen as 50/25/25. `gtab save` now compares the captured pane geometry against Ghostty's `equalize_splits` result and, when they match, records that action in the workspace script so even layouts reopen even.
 
 Uneven layouts you arranged on purpose are still restored at Ghostty's default 50/50 per split. Ghostty's AppleScript API can only create splits, not set their exact ratios, so arbitrary proportions are not preserved yet.
+
+</details>
+
+---
+
+## Uninstall
+
+```bash
+# 1. Disable the Ghostty shortcut, then reload the Ghostty config
+gtab set ghostty_shortcut off
+
+# 2. Remove the shell integration line from your shell rc, if you added one
+#    eval "$(gtab shell-init zsh)"
+
+# 3. Remove the binary
+brew uninstall gtab        # or: cargo uninstall gtab
+
+# 4. Optionally remove saved workspaces and settings
+rm -rf ~/.config/gtab
+```
 
 ---
 
