@@ -26,6 +26,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const DOUBLE_CLICK_MS: u64 = 350;
 const MIN_WIDTH: u16 = 36;
@@ -823,7 +824,7 @@ impl App {
         let labels: Vec<u16> = self
             .visible_labels()
             .iter()
-            .map(|label| label.chars().count() as u16)
+            .map(|label| label.width() as u16)
             .collect();
 
         // Start as wide as the grid may get, then shrink until the widest row
@@ -1951,17 +1952,16 @@ fn entry_label(name: &str) -> String {
     format!("[{name}]")
 }
 
+/// Pads or truncates `label` to exactly `cell_width` terminal columns. Widths
+/// are display widths, so a CJK name fills the cell instead of spilling past
+/// it and shifting every cell after it on the row.
 fn fit_grid_cell(label: &str, cell_width: u16) -> String {
     let width = cell_width as usize;
-    let chars: Vec<char> = label.chars().collect();
-    let truncated = if chars.len() > width {
+    let mut text = if label.width() > width {
         if width <= 3 {
-            chars.into_iter().take(width).collect::<String>()
+            take_width(label, width)
         } else {
-            let mut text = chars
-                .into_iter()
-                .take(width.saturating_sub(3))
-                .collect::<String>();
+            let mut text = take_width(label, width - 3);
             text.push_str("...");
             text
         }
@@ -1969,7 +1969,20 @@ fn fit_grid_cell(label: &str, cell_width: u16) -> String {
         label.to_string()
     };
 
-    format!("{truncated:<width$}")
+    // A wide character that does not fit leaves a one column hole to fill.
+    text.push_str(&" ".repeat(width.saturating_sub(text.width())));
+    text
+}
+
+/// Longest prefix of `text` that fits in `max_width` terminal columns.
+fn take_width(text: &str, max_width: usize) -> String {
+    let mut used = 0;
+    text.chars()
+        .take_while(|ch| {
+            used += ch.width().unwrap_or(0);
+            used <= max_width
+        })
+        .collect()
 }
 
 /// Widest grid the pane could hold: every column costs at least a minimum
@@ -4151,6 +4164,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn directory_grid_clicks_land_on_names_with_wide_characters() {
+        // Regression: cell widths counted chars, so every CJK character drew
+        // one column wider than the grid assumed. Later cells drifted right,
+        // overflowing rows wrapped, and clicks selected a neighbouring name.
+        let names = [
+            "circle",
+            "gtab",
+            "kage",
+            "learn",
+            "limn-画布",
+            "limns-灵感",
+            "limns-board",
+            "lingo",
+            "md",
+            "new",
+            "paper",
+            "reel",
+            "tag-data",
+            "video",
+        ];
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = names
+            .into_iter()
+            .map(|name| directory(name, "/tmp"))
+            .collect();
+        app.mode = BrowserMode::Directory;
+
+        let rows = render_cells(&mut app, 80, 24);
+        let screen: Vec<&str> = rows.iter().map(|(row, _)| row.as_str()).collect();
+        for (index, name) in names.iter().enumerate() {
+            let label = entry_label(name);
+            let (y, (row, columns)) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, (row, _))| row.contains(&label))
+                .unwrap_or_else(|| panic!("{label} not drawn: {screen:#?}"));
+            let start = columns[row.find(&label).unwrap()];
+            let end = start + label.width() as u16 - 1;
+
+            for x in [start, end] {
+                assert_eq!(
+                    app.list_index_at(x, y as u16),
+                    Some(index),
+                    "click at ({x}, {y}) missed {label}: {screen:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grid_cells_fill_their_width_in_terminal_columns() {
+        assert_eq!(fit_grid_cell("[画布]", 10), "[画布]    ");
+        assert_eq!(fit_grid_cell("[limn-画布]", 9), "[limn-...");
+        // Four columns before the ellipsis: "布" would take columns 4 and 5,
+        // so it is dropped and its missing column is padded.
+        assert_eq!(fit_grid_cell("[画布画布]", 7), "[画... ");
+        for width in 1..14 {
+            assert_eq!(
+                fit_grid_cell("[limns-灵感]", width).width(),
+                width as usize,
+                "cell of width {width}"
+            );
+        }
+    }
+
     fn workspace_with_layout(name: &str, root: WorkspacePaneLayout) -> Workspace {
         let mut workspace = workspace(name);
         workspace.layout = vec![tab_layout(root)];
@@ -4170,6 +4249,32 @@ mod tests {
                 (0..buffer.area.width)
                     .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
                     .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Rendered rows paired with the terminal column each byte starts at, so a
+    /// name containing wide characters can be located by cell.
+    fn render_cells(app: &mut App, width: u16, height: u16) -> Vec<(String, Vec<u16>)> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let app_env = env();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app, &app_env)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        (0..buffer.area.height)
+            .map(|y| {
+                let mut text = String::new();
+                let mut columns = Vec::new();
+                let mut x = 0;
+                while x < buffer.area.width {
+                    let symbol = buffer.cell((x, y)).unwrap().symbol();
+                    columns.extend(std::iter::repeat_n(x, symbol.len()));
+                    text.push_str(symbol);
+                    x += symbol.width().max(1) as u16;
+                }
+                (text, columns)
             })
             .collect()
     }
