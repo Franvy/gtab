@@ -17,10 +17,11 @@ Save your current Ghostty window layout as a named workspace. Reopen it later wi
 ## Install
 
 ```bash
-brew tap Franvy/gtab
-brew install gtab
+brew install franvy/gtab/gtab
 gtab init
 ```
+
+The Homebrew build runs on Apple Silicon. On an Intel Mac, build from source (below).
 
 `gtab init` writes a managed Ghostty keybind file and includes it from your Ghostty config. Reload the config with **Cmd+Shift+,** (or restart Ghostty), then press **Cmd+G** inside any Ghostty shell to open the launcher.
 
@@ -40,7 +41,7 @@ gtab init
 
 </details>
 
-Update with `brew upgrade gtab`.
+Update with `brew upgrade franvy/gtab/gtab`.
 
 ### Optional: silent shortcut
 
@@ -368,7 +369,7 @@ gtab set ghostty_shortcut off
 #    eval "$(gtab shell-init zsh)"
 
 # 3. Remove the binary
-brew uninstall gtab        # or: cargo uninstall gtab
+brew uninstall franvy/gtab/gtab   # or: cargo uninstall gtab
 
 # 4. Optionally remove saved workspaces and settings
 rm -rf ~/.config/gtab
